@@ -93,8 +93,17 @@ function submitFirstJob(){ # *location, script, resume script
 }
 
 function deleteJob(){ #jobid
-    sqlite3 "$db_name" "DELETE FROM jobs WHERE JOBID='$1';"
-    scancel $1
+    if [ $# -eq 0 ];then
+        result=$(sqlite3 "$db_name" "SELECT * FROM jobs;")
+        while IFS='|' read -r id jobid status location type script ; do
+            scancel $jobid
+            # sqlite3 "$db_name" "DELETE FROM jobs WHERE JOBID='$jobid';"
+        done <<< "$result";
+        sqlite3 "$db_name" "DELETE FROM jobs;"
+    else
+        sqlite3 "$db_name" "DELETE FROM jobs WHERE JOBID='$1';"
+        scancel $1
+    fi
 }
 
 function restartJob(){ #jobid
@@ -104,6 +113,14 @@ function restartJob(){ #jobid
         deleteJob $1
         submitFirstJob $location
     fi
+}
+
+function plotter(){ #plotScript
+    result=$(sqlite3 "$db_name" "SELECT * FROM jobs;")
+    while IFS='|' read -r id jobid status location type script ; do
+        cd "$location"
+        eval bash $1 &
+    done <<< "$result";
 }
 
 if [ $# -eq 0 ];then
@@ -142,7 +159,11 @@ elif [ $1 = "view" ];then
     echo "$result"
 elif [ $1 = "delete" ];then
     if [ $# -eq 2 ]; then
-        deleteJob $2
+        if [ $2 = "all" ];then
+            deleteJob
+        else
+            deleteJob $2
+        fi
     else
         echo "Incorrect number of arguments were passed"
     fi
@@ -158,6 +179,14 @@ elif [ $1 = "update" ];then
     fi
 elif [ $1 = "autoupdate" ];then
     statusUpdater
+elif [ $1 = "plot" ];then
+    if [ $# -eq 2 ]; then
+        plotter $2
+    elif [ $# -eq 1 ]; then
+        plotter "plot.sh"
+    else
+        echo "Incorrect number of arguments were passed"
+    fi
 else
     echo "Invalid command"
     echo "Usage: $0 [insert|view|delete|update|autoupdate|init|submit|deleteall]"

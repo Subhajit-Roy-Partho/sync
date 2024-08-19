@@ -106,12 +106,18 @@ function deleteJob(){ #jobid
     fi
 }
 
-function restartJob(){ #jobid
+function restartJob(){ #jobid startScript, resumeScript
     result=$(sqlite3 "$db_name" "SELECT * FROM jobs WHERE JOBID='$1';");
     if [[ -n "$result" ]]; then
         IFS='|' read -r id jobid status location type script<<<$result
         deleteJob $1
-        submitFirstJob $location
+        if [ $# -eq 3 ]; then
+            submitFirstJob $location $2 $3
+        elif [ $# -eq 2 ]; then
+            submitFirstJob $location $2
+        else
+            submitFirstJob $location
+        fi
     fi
 }
 
@@ -119,6 +125,7 @@ function plotter(){ #plotScript
     result=$(sqlite3 "$db_name" "SELECT * FROM jobs;")
     while IFS='|' read -r id jobid status location type script ; do
         cd "$location"
+        pwd
         eval bash $1 &
     done <<< "$result";
 }
@@ -139,7 +146,14 @@ elif [ $1 = "submit" ];then
     else
         echo "Incorrect number of arguments were passed"
     fi
-
+elif [ $1 = "start" ];then
+    if [ $# -eq 3 ]; then
+        submitFirstJob $2 $3 $3
+    elif [ $# -eq 2 ]; then
+        submitFirstJob $2 "start.sh" "start.sh"
+    else
+        echo "Incorrect number of arguments were passed"
+    fi
 
 elif [ $1 = "restart" ];then
     if [ $# -eq 2 ]; then
@@ -167,9 +181,9 @@ elif [ $1 = "delete" ];then
     else
         echo "Incorrect number of arguments were passed"
     fi
-elif [ $1 = "deleteall" ];then
-    sqlite3 "$db_name" "DELETE FROM jobs;"
-    echo "All jobs have been deleted from the database"
+# elif [ $1 = "deleteall" ];then
+#     sqlite3 "$db_name" "DELETE FROM jobs;"
+#     echo "All jobs have been deleted from the database"
 
 elif [ $1 = "update" ];then
     if [ $# -eq 3 ]; then
@@ -183,11 +197,12 @@ elif [ $1 = "plot" ];then
     if [ $# -eq 2 ]; then
         plotter $2
     elif [ $# -eq 1 ]; then
-        plotter "plot.sh"
+        # plotter "plot.sh"
+        plotter "script.sh plot"
     else
         echo "Incorrect number of arguments were passed"
     fi
 else
     echo "Invalid command"
-    echo "Usage: $0 [insert|view|delete|update|autoupdate|init|submit|deleteall]"
+    echo "Usage: $0 [insert|view|delete|update|autoupdate|init|submit|start|restart|plot]"
 fi

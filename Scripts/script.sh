@@ -20,7 +20,9 @@ function jobSubmitter(){ #start, step, stop
         createDir "$i"
         rsync -av --ignore-existing ../main/* "$i"
         echo "T=$i" >> "$i/input"
+        cd "$i"
         eval $program &
+        cd ..
     done
     cd ..
     

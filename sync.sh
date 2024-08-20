@@ -147,7 +147,9 @@ elif [ $1 = "submit" ];then
         echo "Incorrect number of arguments were passed"
     fi
 elif [ $1 = "start" ];then
-    if [ $# -eq 3 ]; then
+    if [ $# -eq 4 ]; then
+        submitFirstJob $2 $3 $4
+    elif [ $# -eq 3 ]; then
         submitFirstJob $2 $3 $3
     elif [ $# -eq 2 ]; then
         submitFirstJob $2 "start.sh" "start.sh"

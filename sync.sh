@@ -1,4 +1,4 @@
-db_name="/scratch/sroy85/sync/test.db"
+db_name="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test.db"
 
 function updateStatus(){ #jobid stautus
     sqlite3 "$db_name" "UPDATE jobs SET STATUS='$2' WHERE JOBID='$1';"

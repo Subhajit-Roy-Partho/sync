@@ -1,8 +1,9 @@
-start=0.02
-stop=0.2
-step=0.02
+start=0
+stop=0
+step=0
 execType=1
-program="oxDNA input >out.txt"
+program="oxDNA inputForce > outForce.txt ;oxDNA input >out.txt"
+programContinue="oxDNA input >out.txt"
 inputFile="input.phb"
 
 function createDir(){ #dirName
@@ -16,14 +17,35 @@ function createDir(){ #dirName
 function jobSubmitter(){ #start, step, stop
     createDir output
     cd output
-    for i in $(seq $1 $2 $3); do
-        createDir "$i"
-        rsync -av --ignore-existing ../main/* "$i"
-        echo "T=$i" >> "$i/input"
-        cd "$i"
-        eval $program &
-        cd ..
-    done
+    if [ $step -eq 0 ]; then
+        echo "Single job"
+        rsync -av --ignore-existing ../main/* .
+        rsync -rzvP ../main/input .
+         if [ -f "energy.dat" ]; then
+                echo "Continuing job"
+                eval $programContinue &
+            else
+                echo "Starting fresh job"
+                eval $program &
+            fi
+    else
+        echo "Multiple jobs from $1 to $3 with step $2"
+        for i in $(seq $1 $2 $3); do
+            createDir "$i"
+            rsync -av --ignore-existing ../main/* "$i"
+            rsync -rzvP ../main/input "$i"
+            echo "T=$i" >> "$i/input"
+            cd "$i"
+            if [ -f "energy.dat" ]; then
+                echo "Continuing job"
+                eval $programContinue &
+            else
+                echo "Starting fresh job"
+                eval $program &
+            fi
+            cd ..
+        done
+    fi
     cd ..
     
 }
@@ -44,7 +66,7 @@ function plotter(){ #start, step, stop inputFile
         fi
         cd "output/$i"
         rm -rf last.mgl
-        terminal autoconvert -i "temp.phb" -d "last_conf.dat" -o "last.mgl" &
+        terminal autoconvert -i "$4" -d "last_conf.dat" -o "last.mgl" &
         cd ../..
     done
 
@@ -58,9 +80,8 @@ function plotter(){ #start, step, stop inputFile
 if [ $# -eq 0 ];then
     echo "Main function called"
     jobSubmitter $start $step $stop
-    plotter $start $step $stop
 elif [ $1 = "plot" ];then
-    plotter $start $step $stop
+    plotter $start $step $stop $inputFile
 elif [ $1 = "submit" ];then
-    jobSubmitter $start $step $stop
+    jobSubmitter $start $step $stop $inputFile
 fi

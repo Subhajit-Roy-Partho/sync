@@ -78,8 +78,16 @@ function statusUpdater(){
 function submitFirstJob(){ # *location, script, resume script
     cd "$1"
     if [ $# -lt 2 ]; then
+        if [ ! -f "start.sh" ]; then
+            echo "start.sh not found in the directory"
+            return
+        fi
         newjobid=$(sbatch start.sh)
     else
+        if [ ! -f "$2" ]; then
+            echo "$2 not found in the directory"
+            return
+        fi
         newjobid=$(sbatch $2)
     fi
     newjobid=${newjobid##* }
@@ -87,6 +95,10 @@ function submitFirstJob(){ # *location, script, resume script
     if [ $# -lt 3 ]; then
         sqlite3 "$db_name" "INSERT INTO jobs (jobid,status,location,type,script) VALUES ('$newjobid',2,'$1','slurm','resume.sh');";
     else
+        if [ ! -f "$3" ]; then
+            echo "$3 not found in the directory"
+            return
+        fi
         sqlite3 "$db_name" "INSERT INTO jobs (jobid,status,location,type,script) VALUES ('$newjobid',2,'$1','slurm','$3');"
     fi
     # updateStatus $newjobid 2
@@ -177,8 +189,10 @@ elif [ $1 = "delete" ];then
     if [ $# -eq 2 ]; then
         if [ $2 = "all" ];then
             deleteJob
-        else
+        elif [[ $2 =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
             deleteJob $2
+        else
+            sqlite3 "$db_name" "DELETE FROM jobs WHERE $2;"
         fi
     else
         echo "Incorrect number of arguments were passed"

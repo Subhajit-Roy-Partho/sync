@@ -6,6 +6,8 @@ program="oxDNA inputForce > outForce.txt ;oxDNA input >out.txt"
 programContinue="oxDNA input >out.txt"
 inputFile="input.phb"
 
+#program="pmemd.cuda -O -i prod.mdin -p new.prmtop -c prod.rst7 -x prod.nc -inf prod.mdinfo -o energy.dat -r prod.rst7 -ref prod.rst7"
+
 function createDir(){ #dirName
     if [ ! -d "$1" ];then
         mkdir -p "$1"
@@ -17,7 +19,7 @@ function createDir(){ #dirName
 function jobSubmitter(){ #start, step, stop
     createDir output
     cd output
-    if [ $step -eq 0 ]; then
+    if [ $2 -eq 0 ]; then
         echo "Single job"
         rsync -av --ignore-existing ../main/* .
         rsync -rzvP ../main/input .
@@ -28,6 +30,38 @@ function jobSubmitter(){ #start, step, stop
                 echo "Starting fresh job"
                 eval $program &
             fi
+    elif [ $1 -eq $3 ]; then
+        echo "Replicas of $2 will be created"
+        for i in $(seq 1 $2); do
+            createDir "$i"
+            rsync -av --ignore-existing ../main/* "$i"
+            rsync -rzvP ../main/input "$i"
+            cd "$i"
+            if [ -f "energy.dat" ]; then
+                echo "Continuing job"
+                if [ -f "prod.nc" ]; then
+                  if [ -f "combined.nc" ];then
+                    echo"Merging nc files"
+                    mv combined.nc "combined_$RANDOM.nc"
+                    mv merged_combined.nc combined.nc
+                    mv prod.nc "prod_$RANDOM.nc"
+                    cat energy.dat >> combined.dat
+                    mv energy.dat "energy_$RANDOM.dat"
+                  else
+                    mv prod.nc combined.nc
+                    mv energy.dat combined.dat
+                    echo "prod renamed to combined"
+                  fi
+                else
+                  echo "This is not a AMBER simulation"
+                fi
+                eval $programContinue &
+            else
+                echo "Starting fresh job"
+                eval $program &
+            fi
+            cd ..
+        done
     else
         echo "Multiple jobs from $1 to $3 with step $2"
         for i in $(seq $1 $2 $3); do
@@ -60,9 +94,9 @@ function plotter(){ #start, step, stop inputFile
 
     for i in $(seq $1 $2 $3); do
         if [ "$i" = "$1" ]; then
-            echo 'plot "output/'$i'/energy.ign" u 1:4 w l t "T='$i'"'>>plot.gp
+            echo 'plot "output/'$i'/energy.dat" u 1:4 w l t "T='$i'"'>>plot.gp
         else
-            echo 'replot "output/'$i'/energy.ign" u 1:4 w l t "T='$i'"'>>plot.gp
+            echo 'replot "output/'$i'/energy.dat" u 1:4 w l t "T='$i'"'>>plot.gp
         fi
         cd "output/$i"
         rm -rf last.mgl

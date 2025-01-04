@@ -1,4 +1,4 @@
-program="sync.sh;sync.sh plot"
+program="sync.sh"
 
 while true; do
     eval $program

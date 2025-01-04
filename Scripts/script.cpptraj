@@ -1,3 +1,4 @@
+parm new.prmtop
 trajin combined.nc
 trajin prod.nc
 trajout merged_combined.nc

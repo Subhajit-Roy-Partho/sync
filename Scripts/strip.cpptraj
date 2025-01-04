@@ -1,0 +1,13 @@
+# Load the topology and trajectory data
+parm new.prmtop       # Load the topology file
+trajin prod.rst7      # Load the restart file (or trajectory file)
+
+# Remove water and ions
+strip :WAT,Na+,Cl-    # Strip water (WAT) and common ions (Na+ and Cl-)
+
+# Apply auto-image to adjust the box
+#autoimage            # Apply auto-imaging to the system
+
+# Output the processed structure to a PDB file
+trajout processed.pdb pdb   # Save the final structure in PDB format
+

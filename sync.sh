@@ -5,6 +5,11 @@ function updateStatus(){ #jobid stautus
 }
 
 function jobSubmitter(){ 
+    count = $(sqlite3 "$db_name" "SELECT COUNT(*) FROM jobs WHERE LOCATION='$1';")
+    if [ $count -gt 0 ]; then
+        echo "Job already submitted"
+        return
+    fi
     result=$(sqlite3 "$db_name" "SELECT * FROM jobs WHERE STATUS=1;");
     if [[ -n "$result" ]]; then
         while IFS='|' read -r id jobid status location type script ; do
@@ -118,6 +123,16 @@ function deleteJob(){ #jobid
     fi
 }
 
+function deleteJobById(){ #jobid
+    if [ $# -eq 0 ];then
+        echo "Missing id"
+    else
+        result=$(sqlite3 "$db_name" "SELECT JOBID FROM jobs WHERE ID='$1';")
+        sqlite3 "$db_name" "DELETE FROM jobs WHERE ID='$1';"
+        scancel $1
+    fi
+}
+
 function restartJob(){ #jobid startScript, resumeScript
     result=$(sqlite3 "$db_name" "SELECT * FROM jobs WHERE JOBID='$1';");
     if [[ -n "$result" ]]; then
@@ -194,12 +209,15 @@ elif [ $1 = "delete" ];then
         else
             sqlite3 "$db_name" "DELETE FROM jobs WHERE $2;"
         fi
+    elif [ $# -eq 3 ]; then
+        if [ $2 = "id" ];then
+            deleteJobById $3
+        else
+            echo "Invalid command"
+        fi
     else
         echo "Incorrect number of arguments were passed"
     fi
-# elif [ $1 = "deleteall" ];then
-#     sqlite3 "$db_name" "DELETE FROM jobs;"
-#     echo "All jobs have been deleted from the database"
 
 elif [ $1 = "update" ];then
     if [ $# -eq 3 ]; then

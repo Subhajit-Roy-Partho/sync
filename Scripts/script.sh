@@ -1,12 +1,14 @@
 start=0
 stop=0
-step=0
+step=4
 execType=1
-program="oxDNA inputForce > outForce.txt ;oxDNA input >out.txt"
-programContinue="oxDNA input >out.txt"
+#program="oxDNA inputForce > outForce.txt ;oxDNA input >out.txt"
+#programContinue="oxDNA input >out.txt"
 inputFile="input.phb"
 
-#program="pmemd.cuda -O -i prod.mdin -p new.prmtop -c prod.rst7 -x prod.nc -inf prod.mdinfo -o energy.dat -r prod.rst7 -ref prod.rst7"
+program="pmemd.cuda -O -i prod.mdin -p new.prmtop -c prod.rst7 -x prod.nc -inf prod.mdinfo -o energy.dat -r prod.rst7 -ref prod.rst7"
+programContinue="pmemd.cuda -O -i prod.mdin -p new.prmtop -c prod.rst7 -x prod.nc -inf prod.mdinfo -o energy.dat -r prod.rst7 -ref prod.rst7"
+
 
 function createDir(){ #dirName
     if [ ! -d "$1" ];then
@@ -41,15 +43,19 @@ function jobSubmitter(){ #start, step, stop
                 echo "Continuing job"
                 if [ -f "prod.nc" ]; then
                   if [ -f "combined.nc" ];then
-                    echo"Merging nc files"
-                    mv combined.nc "combined_$RANDOM.nc"
+                    echo "Merging nc files"
+                    cp -r combined.nc "combined_$RANDOM.nc"
+		    cpptraj script.cpptraj
                     mv merged_combined.nc combined.nc
-                    mv prod.nc "prod_$RANDOM.nc"
+                    cp prod.nc "prod_$(date +%s).nc"
                     cat energy.dat >> combined.dat
-                    mv energy.dat "energy_$RANDOM.dat"
+		    cp energy.dat "energy_$(date +%s).dat"
+		    rm energy.dat
                   else
-                    mv prod.nc combined.nc
-                    mv energy.dat combined.dat
+                    cp prod.nc combined.nc
+		    cp proc.nc prod_1.nc
+                    cp energy.dat combined.dat
+		    cp energy.dat energy_1.dat
                     echo "prod renamed to combined"
                   fi
                 else

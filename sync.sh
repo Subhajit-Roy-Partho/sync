@@ -5,7 +5,7 @@ function updateStatus(){ #jobid stautus
 }
 
 function jobSubmitter(){ 
-    count = $(sqlite3 "$db_name" "SELECT COUNT(*) FROM jobs WHERE LOCATION='$1';")
+    count=$(sqlite3 "$db_name" "SELECT COUNT(*) FROM jobs WHERE LOCATION='$1';")
     if [ $count -gt 0 ]; then
         echo "Job already submitted"
         return

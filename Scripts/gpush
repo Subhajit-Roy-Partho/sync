@@ -1,0 +1,156 @@
+#!/bin/bash
+
+# Script to output GPUs available for allocation in Slurm,
+# showing only nodes that currently have one or more GPUs available.
+
+echo "Probing Slurm for GPUs available for allocation..."
+echo "==================================================================="
+printf "%-20s %-25s %-10s %-10s %-10s\n" "Node" "GPU_Type" "Configured" "Used" "Available"
+echo "-------------------- ------------------------- ---------- ---------- ----------"
+
+# Function to parse a TRES string
+parse_tres_string() {
+    local tres_string="$1"
+    local -n result_map=$2
+
+    for key_in_map in "${!result_map[@]}"; do unset result_map["$key_in_map"]; done
+
+    if [ -z "$tres_string" ] || [[ ! "$tres_string" == *gres/gpu* ]]; then
+        return
+    fi
+
+    IFS=',' read -ra tres_parts <<< "$tres_string"
+    for part in "${tres_parts[@]}"; do
+        if [[ "$part" == gres/gpu* ]]; then
+            local gres_key="${part%%=*}"
+            local gres_count="${part#*=}"
+            local gpu_type_from_spec="gpu"
+
+            if [[ "$gres_key" == gres/gpu:* ]]; then
+                gpu_type_from_spec="${gres_key#gres/gpu:}"
+            elif [[ "$gres_key" != "gres/gpu" ]]; then
+                continue
+            fi
+            
+            if [[ "$gres_count" =~ ^[0-9]+$ ]] && [ "$gres_count" -ge 0 ]; then
+                 result_map["$gpu_type_from_spec"]=$(( ${result_map["$gpu_type_from_spec"]:-0} + gres_count ))
+            fi
+        fi
+    done
+}
+
+sinfo_output=$(sinfo -N -h -o "%N %T")
+
+if [ -z "$sinfo_output" ]; then
+    echo "No output from sinfo. Slurm might not be running or correctly configured."
+    exit 1
+fi
+
+declare -A total_available_gpus_by_type
+any_node_printed=0
+
+while IFS= read -r line; do
+    node_name=$(echo "$line" | awk '{print $1}')
+    node_state=$(echo "$line" | awk '{print $NF}')
+
+    case "$node_state" in
+        DOWN*|DRAIN*|DRNG*|FAIL*|MAINT*|POWER_DOWN|POWER_UP|REBOOT*|UNK*)
+            continue
+            ;;
+    esac
+
+    scontrol_node_output=$(scontrol show node -o "$node_name" 2>/dev/null)
+    if [ -z "$scontrol_node_output" ]; then
+        continue
+    fi
+
+    cfg_tres_str=$(echo "$scontrol_node_output" | awk '{for(i=1;i<=NF;i++) if($i ~ /^CfgTRES=/) {sub(/^CfgTRES=/, "", $i); print $i; exit}}')
+    alloc_tres_str=$(echo "$scontrol_node_output" | awk '{for(i=1;i<=NF;i++) if($i ~ /^AllocTRES=/) {sub(/^AllocTRES=/, "", $i); print $i; exit}}')
+
+    if [[ "$cfg_tres_str" != *gres/gpu* ]]; then
+        continue
+    fi
+
+    declare -A configured_gpus_map
+    declare -A used_gpus_map
+
+    parse_tres_string "$cfg_tres_str" configured_gpus_map
+    parse_tres_string "$alloc_tres_str" used_gpus_map
+    
+    # --- Start: Pruning logic for generic "gpu" key ---
+    if [[ -n "${configured_gpus_map["gpu"]}" ]]; then # Check if generic "gpu" key exists
+        has_specific_gpu_keys_in_conf=0
+        for key in "${!configured_gpus_map[@]}"; do
+            if [[ "$key" != "gpu" ]]; then
+                has_specific_gpu_keys_in_conf=1
+                break
+            fi
+        done
+        if [[ "$has_specific_gpu_keys_in_conf" -eq 1 ]]; then
+            # If specific GPU types (e.g., "a100") are present,
+            # remove the generic "gpu" entry to avoid redundancy.
+            # echo "DEBUG: Node $node_name. Generic 'gpu' key found alongside specific types. Removing 'gpu' key from configured_gpus_map." >&2
+            unset configured_gpus_map["gpu"]
+            # Note: We don't strictly need to unset from used_gpus_map["gpu"] because the loop below
+            # will only iterate over keys remaining in configured_gpus_map. If "gpu" is removed,
+            # it won't be used to index used_gpus_map.
+        fi
+    fi
+    # --- End: Pruning logic ---
+    
+    node_output_lines_buffer=""
+    node_has_any_available_gpus_on_this_node=0
+
+    # Iterate over the (potentially pruned) configured GPU types for this node
+    for gpu_type in "${!configured_gpus_map[@]}"; do
+        conf_count=${configured_gpus_map[$gpu_type]}
+        used_count=${used_gpus_map[$gpu_type]:-0}
+        available_count=$(( conf_count - used_count ))
+
+        if [ "$available_count" -lt 0 ]; then
+            available_count=0
+        fi
+
+        current_gpu_line_data=$(printf "%-20s %-25s %-10s %-10s %-10s" \
+            "$node_name" \
+            "$gpu_type" \
+            "$conf_count" \
+            "$used_count" \
+            "$available_count")
+        node_output_lines_buffer+="${current_gpu_line_data}"
+            
+        if [ "$available_count" -gt 0 ]; then
+            node_has_any_available_gpus_on_this_node=1
+            total_available_gpus_by_type["$gpu_type"]=$(( ${total_available_gpus_by_type["$gpu_type"]:-0} + available_count ))
+        fi
+    done
+
+    if [ "$node_has_any_available_gpus_on_this_node" -eq 1 ]; then
+        printf "%s \n" "$node_output_lines_buffer"
+        any_node_printed=1
+    fi
+done < <(echo "$sinfo_output")
+
+echo "==================================================================="
+
+if [ "$any_node_printed" -eq 1 ]; then
+    echo "Overall summary of currently available GPUs (by type, from all operational nodes):"
+    summary_has_content=0
+    sorted_gpu_types=($(for t in "${!total_available_gpus_by_type[@]}"; do echo "$t"; done | sort))
+
+    for gpu_type in "${sorted_gpu_types[@]}"; do
+        if [ "${total_available_gpus_by_type[$gpu_type]}" -gt 0 ]; then
+            printf "  %-25s : %s\n" "$gpu_type" "${total_available_gpus_by_type[$gpu_type]}"
+            summary_has_content=1
+        fi
+    done
+    if [ "$summary_has_content" -eq 0 ]; then
+        echo "  No specific GPU types found with available units in the summary (this indicates a potential logic issue if any_node_printed was true)."
+    fi
+    echo "-------------------------------------------------------------------"
+else
+    echo "No nodes found with currently available GPUs."
+fi
+echo "Note: 'Available' means configured on an operational node and not currently allocated."
+echo "      Only nodes with at least one available GPU are listed."
+echo "      Node states like DRAIN, DOWN, MAINT, UNK etc. are excluded."

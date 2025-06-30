@@ -11,6 +11,39 @@ function updateStatus(){ #jobid stautus
     sqlite3 "$db_name" "UPDATE jobs SET STATUS='$2' WHERE JOBID='$1';"
 }
 
+# NEW: Finds the best available node based on GPUpreference.
+# Returns "nodename|GPU_Type" on success, empty on failure.
+function find_best_available_gpu_node() {
+    local preferences="$1"
+    # First, ensure the GPU data is recent. It's good practice.
+    echo "INFO: Running a quick GPU status check before finding a node..."
+    updateGpuStatus > /dev/null # Run quietly
+
+    IFS=',' read -ra pref_array <<< "$preferences"
+    for gpu_type in "${pref_array[@]}"; do
+        # Query for a node with the desired GPU type available.
+        # Order by GPU_available DESC to pick the node with the most free slots,
+        # which can be a good strategy for cluster load balancing.
+        local result
+        result=$(sqlite3 "$db_name" "SELECT node, GPU_Type FROM gpu WHERE GPU_Type = '$gpu_type' AND GPU_available > 0 ORDER BY GPU_available DESC LIMIT 1;")
+        if [[ -n "$result" ]]; then
+            echo "$result" # Success: Output "nodename|gputype"
+            return 0
+        fi
+    done
+    echo "ERROR: No preferred GPUs ($preferences) are currently available." >&2
+    return 1 # Failure
+}
+
+# NEW: Preemptively updates the DB to "reserve" a GPU slot.
+function _gpu_soft_allocate() {
+    local node_name="$1"
+    local gpu_type="$2"
+    echo "INFO: Soft-allocating 1x $gpu_type on node $node_name in the database."
+    sqlite3 "$db_name" "UPDATE gpu SET GPU_available = GPU_available - 1, GPU_used = GPU_used + 1 WHERE node = '$node_name' AND GPU_Type = '$gpu_type' AND GPU_available > 0;"
+}
+
+
 function jobSubmitter(){
     count=$(sqlite3 "$db_name" "SELECT COUNT(*) FROM jobs WHERE LOCATION='$1';")
     if [ "$count" -gt 0 ]; then
@@ -62,33 +95,61 @@ function statusUpdater(){
     done <<< "$result";
 }
 
-# ... (The rest of your job management functions: submitFirstJob, deleteJob, etc. remain here unchanged) ...
-function submitFirstJob(){ # *location, script, resume script
-    cd "$1"
-    if [ $# -lt 2 ]; then
-        if [ ! -f "start.sh" ]; then
-            echo "start.sh not found in the directory"
-            return
+# UPDATED: The core submission function with new intelligence.
+function submitFirstJob(){ # location, [script_name], [resume_script_name]
+    local location="$1"
+    local script_name="${2:-start.sh}"
+    local resume_script_name="${3:-resume.sh}"
+    local actual_script_path="$location/$script_name"
+
+    if [ ! -d "$location" ]; then echo "ERROR: Directory '$location' not found."; return 1; fi
+    cd "$location" || return 1
+    if [ ! -f "$script_name" ]; then echo "ERROR: Script '$script_name' not found in '$location'."; return 1; fi
+
+    local newjobid
+    # Check if the script requests a GPU. Regex handles -G1, --gpus=1, etc.
+    if grep -q -E '(^#SBATCH -G|^#SBATCH --gpus=)[1-9]' "$script_name"; then
+        echo "INFO: Job requires a GPU. Searching for the best available based on preference: $GPUpreference"
+        local best_gpu_info; best_gpu_info=$(find_best_available_gpu_node "$GPUpreference")
+
+        if [ -z "$best_gpu_info" ]; then
+            # The find function already printed an error, so we just exit.
+            return 1
         fi
-        newjobid=$(sbatch start.sh)
+
+        local node_to_use; node_to_use=$(echo "$best_gpu_info" | cut -d'|' -f1)
+        local gpu_type_found; gpu_type_found=$(echo "$best_gpu_info" | cut -d'|' -f2)
+
+        echo "SUCCESS: Found best available GPU: 1x $gpu_type_found on node $node_to_use."
+
+        # Preemptively update the database.
+        _gpu_soft_allocate "$node_to_use" "$gpu_type_found"
+
+        # Create a temporary script to add the node constraint.
+        local temp_script; temp_script=$(mktemp "job_submit.XXXXXX.sh")
+        echo "#SBATCH -w $node_to_use" > "$temp_script"
+        cat "$script_name" >> "$temp_script"
+
+        echo "INFO: Submitting job to node $node_to_use..."
+        newjobid=$(sbatch "$temp_script")
+        rm "$temp_script" # Clean up
+
     else
-        if [ ! -f "$2" ]; then
-            echo "$2 not found in the directory"
-            return
-        fi
-        newjobid=$(sbatch $2)
+        # Standard submission for non-GPU jobs.
+        echo "INFO: Job does not request a GPU. Submitting normally."
+        newjobid=$(sbatch "$script_name")
     fi
+
+    # Process the job ID and update the database, regardless of how it was submitted.
+    if [[ -z "$newjobid" ]]; then
+        echo "ERROR: sbatch submission failed. No job ID returned."
+        # Note: We don't "un-allocate" the GPU here. The next `gpu-update` run will correct the state.
+        return 1
+    fi
+
     newjobid=${newjobid##* }
-    echo "Jobid: $newjobid"
-    if [ $# -lt 3 ]; then
-        sqlite3 "$db_name" "INSERT INTO jobs (jobid,status,location,type,script) VALUES ('$newjobid',2,'$1','slurm','resume.sh');";
-    else
-        if [ ! -f "$3" ]; then
-            echo "$3 not found in the directory"
-            return
-        fi
-        sqlite3 "$db_name" "INSERT INTO jobs (jobid,status,location,type,script) VALUES ('$newjobid',2,'$1','slurm','$3');"
-    fi
+    echo "Job submitted with ID: $newjobid"
+    sqlite3 "$db_name" "INSERT INTO jobs (jobid,status,location,type,script) VALUES ('$newjobid', 2, '$location', 'slurm', '$resume_script_name');"
 }
 
 function deleteJob(){ #jobid

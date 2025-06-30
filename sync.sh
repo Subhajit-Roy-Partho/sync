@@ -107,8 +107,8 @@ function submitFirstJob(){ # location, [script_name], [resume_script_name]
     if [ ! -f "$script_name" ]; then echo "ERROR: Script '$script_name' not found in '$location'."; return 1; fi
 
     local newjobid
-    # Check if the script requests a GPU. Regex handles -G1, --gpus=1, etc.
-    if grep -q -E '(^#SBATCH -G|^#SBATCH --gpus=)[1-9]' "$script_name"; then
+    # Check if the script requests a GPU. Regex handles -G 1, --gpus=1, etc.
+   if grep -q -E '^#SBATCH (-G[[:space:]]*|--gpus=)[1-9]' "$script_name"; then
         echo "INFO: Job requires a GPU. Searching for the best available based on preference: $GPUpreference"
         local best_gpu_info; best_gpu_info=$(find_best_available_gpu_node "$GPUpreference")
 

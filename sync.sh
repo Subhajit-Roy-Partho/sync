@@ -410,6 +410,50 @@ function updateGpuStatus() {
     fi
 }
 
+# Submits jobs from all subdirectories within a given parent directory.
+# It looks for a 'start.sh' in each immediate subdirectory.
+function batchSubmitter() {
+    local parent_dir="$1"
+
+    # --- Argument and Directory Validation ---
+    if [ -z "$parent_dir" ]; then
+        echo "Error: Missing directory argument for batch submission." >&2
+        echo "Usage: $0 batch <parent_directory>" >&2
+        return 1
+    fi
+    if ! [ -d "$parent_dir" ]; then
+        echo "Error: '$parent_dir' is not a valid directory." >&2
+        return 1
+    fi
+
+    # --- Main Logic ---
+    # Enable nullglob to correctly handle cases where no subdirectories exist.
+    shopt -s nullglob
+
+    local jobs_found=0
+    # Loop through subdirectories. The trailing '/' ensures only directories are matched.
+    for subfolder in "$parent_dir"/*/; do
+        if [ -f "${subfolder}start.sh" ]; then
+            echo "--------------------------------------------------"
+            echo "Found job in: $subfolder"
+            # Call your existing submission function for this job
+            submitFirstJob "$subfolder" "start.sh" "start.sh"
+            jobs_found=$((jobs_found + 1))
+        fi
+    done
+
+    # Unset nullglob to restore default shell behavior for the rest of the script.
+    shopt -u nullglob
+
+    # --- Final Summary ---
+    echo "--------------------------------------------------"
+    if [ "$jobs_found" -eq 0 ]; then
+        echo "Batch complete. No subfolders with a 'start.sh' script were found in '$parent_dir'."
+    else
+        echo "Batch complete. Submitted $jobs_found jobs from '$parent_dir'."
+    fi
+}
+
 
 # =========================================================================
 # MAIN SCRIPT LOGIC AND COMMAND PARSER
@@ -417,9 +461,9 @@ function updateGpuStatus() {
 
 if [ $# -eq 0 ];then
     echo "Main function called (updating job status and submitting pending)"
-    updateGpuStatus >> /dev/null
+    # updateGpuStatus >> /dev/null
     statusUpdater
-    wait 
+    # wait 
     jobSubmitter
     
 elif [ "$1" = "init" ];then
@@ -520,19 +564,8 @@ elif [ "$1" = "plot" ];then
         echo "Incorrect number of arguments were passed"
     fi
 elif [ "$1" = "batch" ]; then
-    elif [ "$1" = "batch" ]; then
-        if [ -z "$2" ]; then
-            echo "Usage: $0 batch <directory>"
-        elif [ -d "$2" ]; then
-            for subfolder in "$2"/*/; do
-                if [ -f "${subfolder}start.sh" ]; then
-                    echo "Starting job in: $subfolder"
-                    submitFirstJob "$subfolder" "start.sh" "start.sh"
-                fi
-            done
-        else
-            echo "Error: $2 is not a valid directory."
-        fi
+    batchSubmitter "$2"
+
 # elif [ "$1" = "test" ]; then
 #     gpuSetup $2
     # find_best_available_gpu_node "l40,h100"

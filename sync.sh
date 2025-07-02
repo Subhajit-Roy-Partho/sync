@@ -238,6 +238,18 @@ function resubmitPendingJobs(){ #id
 }   
 
 
+function deleteJobByLocation(){ #location
+    if [ $# -eq 0 ];then
+        echo "Missing location"
+    else
+        result=$(sqlite3 "$db_name" "SELECT * FROM jobs WHERE LOCATION LIKE '${1}%'")
+        while IFS='|' read -r id jobid status location type script ; do
+            scancel "$jobid"
+        done <<< "$result";
+        sqlite3 "$db_name" "DELETE FROM jobs WHERE LOCATION LIKE '${1}%';"
+    fi
+}
+
 function deleteJob(){ #jobid
     if [ $# -eq 0 ];then
         result=$(sqlite3 "$db_name" "SELECT * FROM jobs;")
@@ -557,6 +569,8 @@ elif [ "$1" = "delete" ];then
     elif [ $# -eq 3 ]; then
         if [ "$2" = "id" ];then
             deleteJobById "$3"
+        elif [ "$2" = "location" ];then
+            deleteJobByLocation "$3"
         else
             echo "Invalid command"
         fi

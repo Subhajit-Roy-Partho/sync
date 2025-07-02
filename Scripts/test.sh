@@ -1,20 +1,11 @@
-start=0
-stop=0
-step=4
-declare -a program=("/scratch/sroy85/Github/oxOriginal/build/bin/oxDNA inputMC"
-         "/scratch/sroy85/Github/oxOriginal/build/bin/oxDNA inputForce"
-         "/scratch/sroy85/Github/oxOriginal/build/bin/oxDNA input")
-declare -a output=("outMC.txt"
-        "outForce.txt"
-        "out.txt")
+#!/bin/bash
 
-function createDir(){ #dirName
-    if [ ! -d "$1" ];then
-        mkdir -p "$1"
-    else
-        echo "ouput exists"
-    fi
-}
+# ==============================================================================
+#  The Core Pipeline Function
+# ==============================================================================
+# This function is generic and does not need to be edited.
+# It takes two arguments: the NAME of the programs array and the NAME of the
+# output files array.
 
 run_simulation_pipeline() {
     # --- Function Setup ---
@@ -94,74 +85,31 @@ run_simulation_pipeline() {
     return 0
 }
 
-function jobSubmitter(){ #start, step, stop
-    createDir output
-    cd output
-    if [ $2 -eq 0 ]; then
-        echo "Single job"
-        rsync -av --ignore-existing ../main/* .
-        rsync -rzvP ../main/input .
-        run_simulation_pipeline program output
-        
-    elif [ $1 -eq $3 ]; then
-        echo "Replicas of $2 will be created"
-        for i in $(seq 1 $2); do
-            createDir "$i"
-            rsync -av --ignore-existing ../main/* "$i"
-            rsync -rzvP ../main/input "$i"
-            cd "$i"
-            run_simulation_pipeline program output > progress.txt &
-            cd ..
-        done
-    else
-        echo "Multiple jobs from $1 to $3 with step $2"
-        for i in $(seq $1 $2 $3); do
-            createDir "$i"
-            rsync -av --ignore-existing ../main/* "$i"
-            rsync -rzvP ../main/input "$i"
-            echo "T=$i" >> "$i/input"
-            cd "$i"
-            run_simulation_pipeline program output > progress.txt &
-            cd ..
-        done
-    fi
-    cd ..
+
+# ==============================================================================
+#  Main Script Execution (This is the only part you need to edit)
+# ==============================================================================
+
+main() {
+    # --- Configuration ---
+    declare -a PROGRAMS=(
+        "/scratch/sroy85/Github/oxOriginal/build/bin/oxDNA inputMC"
+        "/scratch/sroy85/Github/oxOriginal/build/bin/oxDNA inputForce"
+        "/scratch/sroy85/Github/oxOriginal/build/bin/oxDNA input"
+    )
+
+    declare -a OUTPUT_FILES=(
+        "outMC.txt"
+        "outForce.txt"
+        "out.txt"
+    )
+
+    # --- Run the pipeline ---
+    run_simulation_pipeline PROGRAMS OUTPUT_FILES
     
+    # Capture and exit with the status code from the function
+    exit $?
 }
 
-function plotter(){ #start, step, stop inputFile
-    echo 'set terminal png
-    set output "plot.png"
-    set xlabel "Time (SU)"
-    set ylabel "Energy (SU)"
-    set logscale x
-    '>plot.gp
-
-    for i in $(seq $1 $2 $3); do
-        if [ "$i" = "$1" ]; then
-            echo 'plot "output/'$i'/energy.dat" u 1:4 w l t "T='$i'"'>>plot.gp
-        else
-            echo 'replot "output/'$i'/energy.dat" u 1:4 w l t "T='$i'"'>>plot.gp
-        fi
-        cd "output/$i"
-        rm -rf last.mgl
-        terminal autoconvert -i "$4" -d "last_conf.dat" -o "last.mgl" &
-        cd ../..
-    done
-
-    echo "set output 'plot.png'
-    replot">>plot.gp
-    gnuplot plot.gp
-}
-
-# jobSubmitter $start $step $stop
-
-if [ $# -eq 0 ];then
-    echo "Main function called"
-    jobSubmitter $start $step $stop
-    # jobHandler program output
-elif [ $1 = "plot" ];then
-    plotter $start $step $stop $inputFile
-elif [ $1 = "submit" ];then
-    jobSubmitter $start $step $stop $inputFile
-fi
+# Call the main function to start the script
+main

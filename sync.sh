@@ -179,6 +179,11 @@ function submitFirstJob(){ # *location, script, resume script
         echo "Script $script_name not found in the directory $1"
         return
     fi
+    job_exist=$(sqlite3 "$db_name" "SELECT COUNT(*) FROM jobs WHERE location='$1';")
+    if [ "$job_exist" -gt 0 ]; then
+        echo "Job already submitted for location $1"
+        return
+    fi
     gpuSetup "$script_name"
     newjobid=$(sbatch $script_name)
     newjobid=${newjobid##* }
@@ -194,6 +199,43 @@ function submitFirstJob(){ # *location, script, resume script
         sqlite3 "$db_name" "INSERT INTO jobs (jobid,status,location,type,script) VALUES ('$newjobid',2,'$1','slurm','$3');"
     fi
 }
+
+function deletePendingJobs(){ #id
+    if [ $# -eq 0 ];then
+        result=$(sqlite3 "$db_name" "SELECT * FROM jobs WHERE STATUS=2;")
+        while IFS='|' read -r id jobid status location type script ; do
+            scancel "$jobid"
+        done <<< "$result";
+        sqlite3 "$db_name" "DELETE FROM jobs WHERE STATUS=2;"
+    else
+        sqlite3 "$db_name" "DELETE FROM jobs WHERE ID='$1';"
+        scancel "$(sqlite3 "$db_name" "SELECT JOBID FROM jobs WHERE ID='$1';")"
+    fi
+}
+
+function resubmitPendingJobs(){ #id
+    if [ $# -eq 0 ];then
+        result=$(sqlite3 "$db_name" "SELECT * FROM jobs WHERE STATUS=2;")
+    else
+        result=$(sqlite3 "$db_name" "SELECT * FROM jobs WHERE id='$1';")
+    fi
+    while IFS='|' read -r id jobid status location type script ; do
+        cd "$location"
+        if [ "$type" = "slurm" ];then
+            scancel "$jobid"
+            echo "Resubmitting job $jobid from $location"
+            updateGpuStatus >> /dev/null
+            gpuSetupContinue "$script"
+            newjobid=$(sbatch "$script")
+            newjobid=${newjobid##* }
+            echo "Jobid: $newjobid"
+            sqlite3 "$db_name" "UPDATE jobs SET JOBID='$newjobid' WHERE JOBID='$jobid';"
+            updateStatus "$newjobid" 2
+        elif [ "$type" = "bash" ];then
+            bash "$script"
+        fi
+    done <<< "$result";
+}   
 
 
 function deleteJob(){ #jobid
@@ -540,6 +582,13 @@ elif [ "$1" = "plot" ];then
     fi
 elif [ "$1" = "batch" ]; then
     batchSubmitter "$2"
+
+elif [ "$1" = "resubmit" ]; then
+    if [ $# -eq 2 ]; then
+        resubmitPendingJobs "$2"
+    else
+        resubmitPendingJobs
+    fi
 
 elif [ "$1" = "test" ]; then
     gpuSetupContinue "$2"

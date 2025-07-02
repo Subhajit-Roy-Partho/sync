@@ -53,16 +53,17 @@ function find_best_available_gpu_node() {
 
 
 function jobSubmitter(){
-    count=$(sqlite3 "$db_name" "SELECT COUNT(*) FROM jobs WHERE LOCATION='$1';")
-    if [ "$count" -gt 0 ]; then
-        echo "Job already submitted"
-        return
-    fi
+    # count=$(sqlite3 "$db_name" "SELECT COUNT(*) FROM jobs WHERE LOCATION='$1';")
+    # if [ "$count" -gt 0 ]; then
+    #     echo "Job already submitted"
+    #     return
+    # fi
     result=$(sqlite3 "$db_name" "SELECT * FROM jobs WHERE STATUS=1;");
     if [[ -n "$result" ]]; then
         while IFS='|' read -r id jobid status location type script ; do
             cd "$location"
             if [ "$type" = "slurm" ];then
+                gpuSetupContinue "$script"
                 newjobid=$(sbatch "$script")
                 newjobid=${newjobid##* }
                 echo "Jobid: $newjobid"
@@ -101,6 +102,44 @@ function statusUpdater(){
         3) updateStatus "$jobid" 3 ;;
         esac
     done <<< "$result";
+}
+
+function gpuSetupContinue(){ # filename
+    if [ ! -f "$1" ]; then
+        echo "File $1 not found"
+        return
+    fi
+    # Check if the file contains a line exactly matching "#SCRATCH -G" and that it's the last line.
+    line_info=$(awk '
+  /^#SBATCH -w[[:space:]]+[a-zA-Z0-9_-]+$/ && prev ~ /^#SBATCH -G 1$/ {
+    print NR ":" $0
+  }
+  {
+    prev = $0
+  }
+' "$1")
+    if [[ -n "$line_info" ]]; then
+        echo "The file $1 contains a line exactly matching '#SBATCH -G' at line number: ${line_info%%:*}"
+        echo "INFO: Job requires a GPU. Searching for the best available based on preference: $GPUpreference"
+        local best_gpu_info; best_gpu_info=$(find_best_available_gpu_node "$GPUpreference")
+
+        if [ -z "$best_gpu_info" ]; then
+            # The find function already printed an error, so we just exit.
+            echo "ERROR: No suitable GPU found. Please check the GPU availability or preferences."
+            return 1
+        fi
+
+        local node_to_use; node_to_use=$(echo "$best_gpu_info" | cut -d'|' -f1)
+        local gpu_type_found; gpu_type_found=$(echo "$best_gpu_info" | cut -d'|' -f2)
+
+        # Update script
+
+        sed -i.bak -E "s|^#SBATCH -w[[:space:]]+[a-zA-Z0-9_-]+|#SBATCH -w $node_to_use|" "$1"
+        sqlite3 "$db_name" "UPDATE gpu SET GPU_available = GPU_available - 1, GPU_used = GPU_used + 1 WHERE node = '$node_to_use' AND GPU_Type = '$gpu_type_found' AND GPU_available > 0;"
+
+        echo "SUCCESS: Found best available GPU: 1x $gpu_type_found on node $node_to_use."
+        
+    fi
 }
 
 function gpuSetup(){ # filename
@@ -156,64 +195,6 @@ function submitFirstJob(){ # *location, script, resume script
     fi
 }
 
-
-
-# UPDATED: The core submission function with new intelligence.
-# function submitFirstJob(){ # location, [script_name], [resume_script_name]
-#     local location="$1"
-#     local script_name="${2:-start.sh}"
-#     local resume_script_name="${3:-resume.sh}"
-#     local actual_script_path="$location/$script_name"
-
-#     if [ ! -d "$location" ]; then echo "ERROR: Directory '$location' not found."; return 1; fi
-#     cd "$location" || return 1
-#     if [ ! -f "$script_name" ]; then echo "ERROR: Script '$script_name' not found in '$location'."; return 1; fi
-
-#     local newjobid
-#     # Check if the script requests a GPU. Regex handles -G 1, --gpus=1, etc.
-#    if if grep -q -E '^#SBATCH (-G|--gpus=)[[:space:]]*$' "$script_name"; then
-#         echo "INFO: Job requires a GPU. Searching for the best available based on preference: $GPUpreference"
-#         local best_gpu_info; best_gpu_info=$(find_best_available_gpu_node "$GPUpreference")
-
-#         if [ -z "$best_gpu_info" ]; then
-#             # The find function already printed an error, so we just exit.
-#             return 1
-#         fi
-
-#         local node_to_use; node_to_use=$(echo "$best_gpu_info" | cut -d'|' -f1)
-#         local gpu_type_found; gpu_type_found=$(echo "$best_gpu_info" | cut -d'|' -f2)
-
-#         echo "SUCCESS: Found best available GPU: 1x $gpu_type_found on node $node_to_use."
-
-#         # Preemptively update the database.
-#         _gpu_soft_allocate "$node_to_use" "$gpu_type_found"
-
-#         # Create a temporary script to add the node constraint.
-#         local temp_script; temp_script=$(mktemp "job_submit.XXXXXX.sh")
-#         echo "#SBATCH -w $node_to_use" > "$temp_script"
-#         cat "$script_name" >> "$temp_script"
-
-#         echo "INFO: Submitting job to node $node_to_use..."
-#         newjobid=$(sbatch "$temp_script")
-#         rm "$temp_script" # Clean up
-
-#     else
-#         # Standard submission for non-GPU jobs.
-#         echo "INFO: Job does not request a GPU. Submitting normally."
-#         newjobid=$(sbatch "$script_name")
-#     fi
-
-#     # Process the job ID and update the database, regardless of how it was submitted.
-#     if [[ -z "$newjobid" ]]; then
-#         echo "ERROR: sbatch submission failed. No job ID returned."
-#         # Note: We don't "un-allocate" the GPU here. The next `gpu-update` run will correct the state.
-#         return 1
-#     fi
-
-#     newjobid=${newjobid##* }
-#     echo "Job submitted with ID: $newjobid"
-#     sqlite3 "$db_name" "INSERT INTO jobs (jobid,status,location,type,script) VALUES ('$newjobid', 2, '$location', 'slurm', '$resume_script_name');"
-# }
 
 function deleteJob(){ #jobid
     if [ $# -eq 0 ];then
@@ -460,10 +441,10 @@ function batchSubmitter() {
 # =========================================================================
 
 if [ $# -eq 0 ];then
-    echo "Main function called (updating job status and submitting pending)"
-    # updateGpuStatus >> /dev/null
+    echo "Main function called updating job status and gpu table, then submitting jobs"
+    updateGpuStatus >> /dev/null &
     statusUpdater
-    # wait 
+    wait
     jobSubmitter
     
 elif [ "$1" = "init" ];then
@@ -566,7 +547,8 @@ elif [ "$1" = "plot" ];then
 elif [ "$1" = "batch" ]; then
     batchSubmitter "$2"
 
-# elif [ "$1" = "test" ]; then
+elif [ "$1" = "test" ]; then
+    gpuSetupContinue "$2"
 #     gpuSetup $2
     # find_best_available_gpu_node "l40,h100"
 else

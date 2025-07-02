@@ -2,12 +2,12 @@ start=0
 stop=0
 step=4
 execType=1
-#program="oxDNA inputForce > outForce.txt ;oxDNA input >out.txt"
-#programContinue="oxDNA input >out.txt"
+program="/scratch/sroy85/Github/oxOriginal/build/bin/oxDNA inputForce > outForce.txt ;/scratch/sroy85/Github/oxOriginal/build/bin/oxDNA input >out.txt"
+programContinue="/scratch/sroy85/Github/oxOriginal/build/bin/oxDNA input >out.txt"
 inputFile="input.phb"
 
-program="pmemd.cuda -O -i prod.mdin -p new.prmtop -c prod.rst7 -x prod.nc -inf prod.mdinfo -o energy.dat -r prod.rst7 -ref prod.rst7"
-programContinue="pmemd.cuda -O -i prod.mdin -p new.prmtop -c prod.rst7 -x prod.nc -inf prod.mdinfo -o energy.dat -r prod.rst7 -ref prod.rst7"
+# program="pmemd.cuda -O -i prod.mdin -p new.prmtop -c prod.rst7 -x prod.nc -inf prod.mdinfo -o energy.dat -r prod.rst7 -ref prod.rst7"
+# programContinue="pmemd.cuda -O -i prod.mdin -p new.prmtop -c prod.rst7 -x prod.nc -inf prod.mdinfo -o energy.dat -r prod.rst7 -ref prod.rst7"
 
 
 function createDir(){ #dirName

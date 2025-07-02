@@ -185,13 +185,13 @@ function submitFirstJob(){ # *location, script, resume script
     echo "Jobid: $newjobid"
     if [ $# -lt 3 ]; then
         echo "Job"
-        # sqlite3 "$db_name" "INSERT INTO jobs (jobid,status,location,type,script) VALUES ('$newjobid',2,'$1','slurm','resume.sh');";
+        sqlite3 "$db_name" "INSERT INTO jobs (jobid,status,location,type,script) VALUES ('$newjobid',2,'$1','slurm','resume.sh');";
     else
         if [ ! -f "$3" ]; then
             echo "$3 not found in the directory"
             return
         fi
-        # sqlite3 "$db_name" "INSERT INTO jobs (jobid,status,location,type,script) VALUES ('$newjobid',2,'$1','slurm','$3');"
+        sqlite3 "$db_name" "INSERT INTO jobs (jobid,status,location,type,script) VALUES ('$newjobid',2,'$1','slurm','$3');"
     fi
 }
 
@@ -301,7 +301,6 @@ function _gpu_cleanup_stale_nodes() {
 }
 
 # Main function to poll Slurm and update the GPU status in the database.
-# Main function to poll Slurm and update the GPU status in the database.
 function updateGpuStatus() {
     # This is the feature/tag we are looking for to identify a private node.
     local TARGET_FEATURE="private"
@@ -331,13 +330,27 @@ function updateGpuStatus() {
         local scontrol_node_output; scontrol_node_output=$(scontrol show node -o "$node_name" 2>/dev/null)
         if [ -z "$scontrol_node_output" ]; then continue; fi
 
+        # --- START: Added logic to handle non-responding, down, or draining nodes ---
+        # Extracts the State field from scontrol output, e.g., "State=IDLE+DRAIN"
+        local node_state; node_state=$(echo "$scontrol_node_output" | grep -o 'State=[^ ]*')
+
+        # Check if the state contains problematic keywords.
+        if [[ "$node_state" == *DOWN* || "$node_state" == *DRAIN* || "$node_state" == *NOT_RESPONDING* ]]; then
+            echo "Node '$node_name' is in a non-operational state ($node_state). Removing from DB and skipping."
+            # Delete the node from the database if it exists.
+            sqlite3 "$db_name" "DELETE FROM gpu WHERE node = '$node_name';"
+            # Skip further processing for this node.
+            continue
+        fi
+        # --- END: Added logic ---
+
         # A faster way to skip non-gpu nodes before more complex parsing
         if [[ "$scontrol_node_output" != *Gres=gpu* ]]; then continue; fi
 
         # --- NEW LOGIC: Parse AvailableFeatures ---
         local features_str
         features_str=$(echo "$scontrol_node_output" | awk '{for(i=1;i<=NF;i++) if($i ~ /^AvailableFeatures=/) {sub(/^AvailableFeatures=/, "", $i); print $i; exit}}')
-        
+
         local is_private=0
         if [[ "$features_str" == *"$TARGET_FEATURE"* ]]; then
             is_private=1
@@ -394,45 +407,26 @@ function updateGpuStatus() {
 # Submits jobs from all subdirectories within a given parent directory.
 # It looks for a 'start.sh' in each immediate subdirectory.
 function batchSubmitter() {
-    local parent_dir="$1"
-
-    # --- Argument and Directory Validation ---
-    if [ -z "$parent_dir" ]; then
-        echo "Error: Missing directory argument for batch submission." >&2
-        echo "Usage: $0 batch <parent_directory>" >&2
+    if [ -z "$1" ]; then
+        echo "No directory specified for batch submission. Please provide a parent directory."
         return 1
     fi
-    if ! [ -d "$parent_dir" ]; then
-        echo "Error: '$parent_dir' is not a valid directory." >&2
-        return 1
-    fi
-
-    # --- Main Logic ---
-    # Enable nullglob to correctly handle cases where no subdirectories exist.
-    shopt -s nullglob
-
-    local jobs_found=0
-    # Loop through subdirectories. The trailing '/' ensures only directories are matched.
-    for subfolder in "$parent_dir"/*/; do
-        if [ -f "${subfolder}start.sh" ]; then
-            echo "--------------------------------------------------"
-            echo "Found job in: $subfolder"
-            # Call your existing submission function for this job
-            submitFirstJob "$subfolder" "start.sh" "start.sh"
-            jobs_found=$((jobs_found + 1))
+    cd "$1"
+    for d in */; do
+        if [ -d "$d" ]; then
+            echo "Processing folder: $d"
+            cd "$d"
+            if [ -f "start.sh" ]; then
+                echo "Found start.sh in $d, submitting job..."
+                submitFirstJob "$PWD" "start.sh" "start.sh"
+            else
+                echo "No start.sh found in $d, skipping..."
+            fi
+            cd ..
         fi
     done
-
-    # Unset nullglob to restore default shell behavior for the rest of the script.
-    shopt -u nullglob
-
-    # --- Final Summary ---
-    echo "--------------------------------------------------"
-    if [ "$jobs_found" -eq 0 ]; then
-        echo "Batch complete. No subfolders with a 'start.sh' script were found in '$parent_dir'."
-    else
-        echo "Batch complete. Submitted $jobs_found jobs from '$parent_dir'."
-    fi
+    echo "Batch submission completed for all subdirectories."
+    cd ..
 }
 
 
@@ -501,7 +495,7 @@ elif [ "$1" = "restart" ];then
     fi
 
 elif [ "$1" = "insert" ];then
-    if [ $# -eq 6 ]; then
+    if [ $# -eq 6 ]; then   
         sqlite3 "$db_name" "INSERT INTO jobs (jobid,status,location,type,script) VALUES ('$2','$3','$4','$5','$6');"
     else
         echo "Incorrect number of arguments were passed"

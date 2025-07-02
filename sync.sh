@@ -3,6 +3,7 @@
 # Get the absolute path to the database, located in the same directory as the script.
 db_name="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test.db"
 GPUpreference="h100,l40,a100,a30"
+# GPUpreference="h100,l40,a100,a40,a6000,V100,a30,RTX6000,RTX2080,GTX1080" # Example preference order, can be modified as needed.
 
 # =========================================================================
 # JOB MANAGEMENT FUNCTIONS (Your Original Functions)
@@ -119,6 +120,7 @@ function gpuSetupContinue(){ # filename
   }
 ' "$1")
     if [[ -n "$line_info" ]]; then
+        # subho place this outside
         echo "The file $1 contains a line exactly matching '#SBATCH -G' at line number: ${line_info%%:*}"
         echo "INFO: Job requires a GPU. Searching for the best available based on preference: $GPUpreference"
         local best_gpu_info; best_gpu_info=$(find_best_available_gpu_node "$GPUpreference")
@@ -126,6 +128,7 @@ function gpuSetupContinue(){ # filename
         if [ -z "$best_gpu_info" ]; then
             # The find function already printed an error, so we just exit.
             echo "ERROR: No suitable GPU found. Please check the GPU availability or preferences."
+            sed -i.bak -E "s|^#SBATCH[[:space:]]+-G[[:space:]]*$|#SBATCH -G 1|" "$1"
             return 1
         fi
 
@@ -138,14 +141,20 @@ function gpuSetupContinue(){ # filename
         sqlite3 "$db_name" "UPDATE gpu SET GPU_available = GPU_available - 1, GPU_used = GPU_used + 1 WHERE node = '$node_to_use' AND GPU_Type = '$gpu_type_found' AND GPU_available > 0;"
 
         echo "SUCCESS: Found best available GPU: 1x $gpu_type_found on node $node_to_use."
-        
+    #subho
+    # elif grep -qE "^#SBATCH -w[[:space:]]+[a-zA-Z0-9_-]+$" "$1"; then
+    #     echo "INFO: Existing node constraint found in $1; updating it to $node_to_use."
+    #     sed -i.bak -E "s|^#SBATCH -w[[:space:]]+[a-zA-Z0-9_-]+$|#SBATCH -w $node_to_use|" "$1"
+    # else
+    #     echo "INFO: No node constraint found in $1; adding one with $node_to_use."
+    #     sed -i.bak -E "s|^#SBATCH[[:space:]]+-G[[:space:]]*$|#SBATCH -G 1\n#SBATCH -w $node_to_use|" "$1"
     fi
 }
 
 function gpuSetup(){ # filename
     if [ ! -f "$1" ]; then
         echo "File $1 not found"
-        return
+        return 1
     fi
     # Check if the file contains a line exactly matching "#SCRATCH -G" and that it's the last line.
     line_info=$(grep -n -E "^#SBATCH -G[[:space:]]*$" "$1")
@@ -157,6 +166,7 @@ function gpuSetup(){ # filename
         if [ -z "$best_gpu_info" ]; then
             # The find function already printed an error, so we just exit.
             echo "ERROR: No suitable GPU found. Please check the GPU availability or preferences."
+            sed -i.bak -E "s|^#SBATCH[[:space:]]+-G[[:space:]]*$|#SBATCH -G 1|" "$1"
             return 1
         fi
 
@@ -604,8 +614,8 @@ elif [ "$1" = "resubmit" ]; then
         resubmitPendingJobs
     fi
 
-elif [ "$1" = "test" ]; then
-    gpuSetupContinue "$2"
+# elif [ "$1" = "test" ]; then
+#     gpuSetupContinue "$2"
 #     gpuSetup $2
     # find_best_available_gpu_node "l40,h100"
 else

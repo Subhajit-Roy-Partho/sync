@@ -155,52 +155,61 @@ function plotter(){ #start, step, stop inputFile
 }
 
 function DNAmean(){
-    function DNAmean(){
-        # Create output/all
-        mkdir -p output/all
+    # Create output/all
+    mkdir -p output/all
 
-        out="output/all/trajectory.dat"
-        : > "$out"   # truncate/create
+    out="output/all/trajectory.dat"
+    : > "$out"   # truncate/create
 
-        found=0
+    found=0
 
-        # Iterate output subfolders in natural sort order, skip 'all'
-        for d in $(ls -1v output 2>/dev/null); do
-            [ "$d" = "all" ] && continue
-            dir="output/$d"
-            traj="$dir/trajectory.dat"
-            if [ -f "$traj" ]; then
-                # ensure a newline separates concatenated files
-                if [ -s "$out" ]; then
-                    printf "\n" >> "$out"
-                fi
-                cat "$traj" >> "$out"
-                found=1
+    echo "Combining trajectory.dat files"
+
+    # Iterate output subfolders in natural sort order, skip 'all'
+    for d in $(ls -1v output 2>/dev/null); do
+        [ "$d" = "all" ] && continue
+        dir="output/$d"
+        traj="$dir/trajectory.dat"
+        if [ -f "$traj" ]; then
+            # ensure a newline separates concatenated files
+            if [ -s "$out" ]; then
+                printf "\n" >> "$out"
             fi
-        done
-
-        if [ "$found" -eq 0 ]; then
-            echo "No trajectory.dat files found to combine." >&2
-            return 1
+            cat "$traj" >> "$out"
+            found=1
         fi
+        echo "Processed $d: $traj"
+    done
 
-        # Copy main/input.top into output/all/
-        if [ -f main/input.top ]; then
-            cp -v main/input.top output/all/
-        else
-            echo "Warning: main/input.top not found" >&2
-        fi
+    if [ "$found" -eq 0 ]; then
+        echo "No trajectory.dat files found to combine." >&2
+        return 1
+    fi
 
-        # Run oat mean inside output/all
-        (cd output/all && oat mean -o mean.dat trajectory.dat)
-        rc=$?
-        if [ $rc -ne 0 ]; then
-            echo "oat mean failed with exit code $rc" >&2
-            return $rc
-        fi
+    # Copy main/input.top into output/all/
+    if [ -f main/input.top ]; then
+        cp -v main/input.top output/all/
+    else
+        echo "Warning: main/input.top not found" >&2
+    fi
 
-        return 0
-    }
+    # Run oat mean inside output/all
+    echo "Calculating mean trajectory using oat mean"
+
+
+    cpu_count=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
+    case $cpu_count in ''|*[!0-9]*) cpu_count=1 ;; esac
+    echo "Using $cpu_count CPU cores for oat mean calculation"
+    (cd output/all && oat mean -o mean.dat -p "$cpu_count" -d dev.json trajectory.dat)
+
+
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        echo "oat mean failed with exit code $rc" >&2
+        return $rc
+    fi
+
+    return 0
 }
 
 # jobSubmitter $start $step $stop

@@ -1,8 +1,7 @@
-program="sync.sh"
+program="sync.sh quick-update"
 
 while true; do
     eval $program
-    sleep 1800
+    sleep 60
 done
 
-# 1175856

@@ -521,6 +521,12 @@ elif [ "$1" = "init" ];then
     );"
     echo "Database has been initialized."
 
+elif [ "$1" = "quick-update" ];then
+    echo "Quick update is called, gpu table is not updated"
+    statusUpdater
+    wait
+    jobSubmitter
+ 
 elif [ "$1" = "gpu-update" ]; then
     updateGpuStatus
 
@@ -566,6 +572,9 @@ elif [ "$1" = "insert" ];then
     fi
 elif [ "$1" = "view" ];then
     result=$(sqlite3 -header -column "$db_name" "SELECT * FROM jobs;")
+    echo "$result"
+elif [ "$1" = "viewFull" ];then
+    result=$(sqlite3 -line "$db_name" "SELECT * FROM jobs;")
     echo "$result"
 elif [ "$1" = "delete" ];then
     if [ $# -eq 2 ]; then
@@ -623,12 +632,14 @@ else
     echo "Usage: $0 COMMAND [arguments]"
     echo ""
     echo "Commands:"
+    echo "  quick-update : Updates the job status without updating the gpu table."
     echo "  init         : Initialize the database."
     echo "  submit       : Submit a job. Usage: $0 submit <location> [script]"
     echo "  start        : Start the first job. Usage: $0 start <location> [startScript] [resumeScript]"
     echo "  restart      : Restart a job. Usage: $0 restart <jobid>"
     echo "  delete       : Delete job(s). Usage: $0 delete all | <jobid> | id <db-id>"
-    echo "  view         : View job status from the database."
+    echo "  view         : View job status from the database (columnar format)."
+    echo "  viewFull     : View job status with complete paths (line format)."
     echo "  update       : Update a job status. Usage: $0 update <jobid> <status>"
     echo "  plot         : Run the plotting script. Usage: $0 plot [plotScript]"
     echo "  gpu-update   : Update GPU status."

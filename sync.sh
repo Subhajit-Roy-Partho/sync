@@ -500,7 +500,7 @@ function batchSubmitter() {
 
 if [ $# -eq 0 ];then
     echo "Main function called updating job status and gpu table, then submitting jobs"
-    updateGpuStatus >> /dev/null &
+    #updateGpuStatus >> /dev/null &
     statusUpdater
     wait
     jobSubmitter
@@ -521,8 +521,9 @@ elif [ "$1" = "init" ];then
     );"
     echo "Database has been initialized."
 
-elif [ "$1" = "quick-update" ];then
+elif [ "$1" = "long-update" ];then
     echo "Quick update is called, gpu table is not updated"
+    updateGpuStatus >> /dev/null &
     statusUpdater
     wait
     jobSubmitter
@@ -632,7 +633,7 @@ else
     echo "Usage: $0 COMMAND [arguments]"
     echo ""
     echo "Commands:"
-    echo "  quick-update : Updates the job status without updating the gpu table."
+    echo "  long-update  : Updates the job status after updating the gpu table. Helpful to determine the best GPU to use."
     echo "  init         : Initialize the database."
     echo "  submit       : Submit a job. Usage: $0 submit <location> [script]"
     echo "  start        : Start the first job. Usage: $0 start <location> [startScript] [resumeScript]"

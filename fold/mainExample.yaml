@@ -3,7 +3,7 @@ Input:
   - Folder: rigidDNAinput
   - Files:
       - "*.top"
-      - "*.dat"
+      - "last_conf.dat"
   - OutputName:
       - input.top
       - last_conf.dat
@@ -18,10 +18,17 @@ Procedure:
       - Memory: "10GB"
       - CPUs: 1
       - LastFileName: "mcLast"
+      - Executable: "/scratch/sroy85/Github/oxOriginal/build/bin/oxDNA"
+      - ExecutableInput: "inputMC"
+      - ResumeExecutable: "/scratch/sroy85/Github/oxOriginal/build/bin/oxDNA inputMC"
   - MDrelax:
       - GPU: true
-  - MD:
+      - JobsPerGPU: 4
+      - ExecutableInput: "inputRelax"
+  - MDProd:
       - GPU: true
+      - JobsPerGPU: 4
+      - ExecutableInput: "input"
 
 Output:
   - Folder: output

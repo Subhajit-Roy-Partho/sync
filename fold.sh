@@ -240,56 +240,127 @@ function statusUpdater() {
     
     echo "Updating job statuses..."
     
-    local result=$(sqlite3 "$db_name" "SELECT id, jobid, location, stage FROM jobs WHERE jobid IS NOT NULL AND jobid != '';")
+    # Save IFS
+    local OLD_IFS="$IFS"
     
-    while IFS='|' read -r id jobid location stage; do
-        checkJob "$jobid"
-        local check_result=$?
-        
-        case $check_result in
-        0) 
-            # Job is running
-            updateStatus "$jobid" 2
-            ;;
-        1) 
-            # Job has finished
-            echo "Job $jobid ($stage) has finished"
+    # First, check jobs that have job IDs
+    IFS='|'
+    local result=$(sqlite3 "$db_name" "SELECT id, jobid, location, stage, status FROM jobs WHERE jobid IS NOT NULL AND jobid != '' AND jobid != 'NULL';")
+    
+    if [ -n "$result" ]; then
+        while read -r id jobid location stage current_status; do
+            # Restore IFS for function calls
+            IFS="$OLD_IFS"
             
-            # Check if simulation completed successfully
-            if checkSimulationCompletion "$location"; then
-                echo "  Simulation completed successfully!"
-                updateStatus "$jobid" 1
-                # Submit next stage
-                submitNextStage "$base_path" "$location" "$stage"
-            else
-                echo "  Checking progress..."
-                # Update progress and check if 100%
-                updateJobProgress "$base_path"
-                
-                # Get the progress for this job
-                local progress=$(sqlite3 "$db_name" "SELECT progress FROM jobs WHERE id=$id;")
-                local progress_int=${progress%.*}
-                
-                if [ "$progress_int" -ge 100 ]; then
-                    echo "  Progress is 100% or more, moving to next stage"
-                    updateStatus "$jobid" 1
-                    submitNextStage "$base_path" "$location" "$stage"
-                else
-                    echo "  Progress is $progress%, job incomplete"
-                    updateStatus "$jobid" 3  # Failed
-                fi
+            # Skip if any critical field is empty
+            if [ -z "$jobid" ] || [ -z "$location" ] || [ -z "$stage" ]; then
+                echo "Warning: Skipping job with missing data (id=$id, jobid=$jobid, location=$location, stage=$stage)"
+                IFS='|'
+                continue
             fi
-            ;;
-        2) 
-            # Job is pending
-            updateStatus "$jobid" 2
-            ;;
-        3) 
-            # Job in other state
-            updateStatus "$jobid" 3
-            ;;
-        esac
-    done <<< "$result"
+            
+            checkJob "$jobid"
+            local check_result=$?
+            
+            case $check_result in
+            0) 
+                # Job is running
+                updateStatus "$jobid" 2
+                ;;
+            1) 
+                # Job has finished
+                echo "Job $jobid ($stage) has finished"
+                
+                # Save variables before calling functions that might corrupt them
+                local saved_stage="$stage"
+                local saved_location="$location"
+                local saved_jobid="$jobid"
+                local saved_id="$id"
+                
+                # Check if simulation completed successfully
+                if checkSimulationCompletion "$saved_location"; then
+                    echo "  Simulation completed successfully!"
+                    updateStatus "$saved_jobid" 1
+                    # Submit next stage
+                    submitNextStage "$base_path" "$saved_location" "$saved_stage"
+                else
+                    echo "  Checking progress..."
+                    # Update progress and check if 100%
+                    updateJobProgress "$base_path"
+                    
+                    # Get the progress for this job
+                    local progress=$(sqlite3 "$db_name" "SELECT progress FROM jobs WHERE id=$saved_id;")
+                    local progress_int=${progress%.*}
+                    
+                    if [ "$progress_int" -ge 100 ]; then
+                        echo "  Progress is 100% or more, moving to next stage"
+                        updateStatus "$saved_jobid" 1
+                        submitNextStage "$base_path" "$saved_location" "$saved_stage"
+                    else
+                        echo "  Progress is $progress%, job incomplete - will resubmit"
+                        # Resubmit the job
+                        if [ -n "$saved_stage" ]; then
+                            local script_name="start_${saved_stage}.sh"
+                            submitJob "$saved_location" "$script_name" "$saved_stage"
+                        else
+                            echo "  ERROR: Stage is empty, cannot resubmit"
+                        fi
+                    fi
+                fi
+                ;;
+            2) 
+                # Job is pending
+                updateStatus "$jobid" 2
+                ;;
+            3) 
+                # Job in other state
+                echo "Job $jobid ($stage) is in unusual state, checking if it needs resubmission..."
+                if [ "$current_status" = "2" ]; then
+                    # Was supposed to be running but isn't, resubmit
+                    echo "  Resubmitting job..."
+                    local script_name="start_${stage}.sh"
+                    submitJob "$location" "$script_name" "$stage"
+                else
+                    updateStatus "$jobid" 3
+                fi
+                ;;
+            esac
+            
+            # Reset IFS for next iteration
+            IFS='|'
+        done <<< "$result"
+    fi
+    
+    # Restore IFS
+    IFS="$OLD_IFS"
+    
+    # Now check for jobs that should be running but have no job ID (possibly never submitted or lost)
+    IFS='|'
+    local pending_result=$(sqlite3 "$db_name" "SELECT id, location, stage FROM jobs WHERE status=2 AND (jobid IS NULL OR jobid = '' OR jobid = 'NULL');")
+    
+    if [ -n "$pending_result" ]; then
+        while read -r id location stage; do
+            # Restore IFS for function calls
+            IFS="$OLD_IFS"
+            
+            # Skip if any critical field is empty
+            if [ -z "$location" ] || [ -z "$stage" ]; then
+                echo "Warning: Skipping job with missing location or stage (id=$id)"
+                IFS='|'
+                continue
+            fi
+            
+            echo "Job at $location ($stage) marked as running but has no job ID - submitting..."
+            local script_name="start_${stage}.sh"
+            submitJob "$location" "$script_name" "$stage"
+            
+            # Reset IFS for next iteration
+            IFS='|'
+        done <<< "$pending_result"
+    fi
+    
+    # Restore IFS
+    IFS="$OLD_IFS"
     
     echo "Status update complete."
 }
@@ -346,11 +417,19 @@ function updateJobProgress() {
     
     echo "Updating job progress..."
     
+    # Save IFS
+    local OLD_IFS="$IFS"
+    IFS='|'
+    
     # Get all jobs from database
     local result=$(sqlite3 "$db_name" "SELECT id, location, stage, max_steps FROM jobs WHERE stage IS NOT NULL;")
     
-    while IFS='|' read -r job_id location stage max_steps; do
+    while read -r job_id location stage max_steps; do
+        # Restore IFS for function calls
+        IFS="$OLD_IFS"
+        
         if [ -z "$location" ] || [ -z "$stage" ] || [ -z "$max_steps" ]; then
+            IFS='|'
             continue
         fi
         
@@ -375,7 +454,13 @@ function updateJobProgress() {
             sqlite3 "$db_name" "UPDATE jobs SET progress = $progress WHERE id = $job_id;"
             echo "  Job $job_id ($stage): $progress% ($avg_step / $max_steps steps)"
         fi
+        
+        # Reset IFS for next iteration
+        IFS='|'
     done <<< "$result"
+    
+    # Restore IFS
+    IFS="$OLD_IFS"
     
     echo "Progress update complete."
 }
@@ -728,6 +813,12 @@ elif [ "$1" = "start" ]; then
     fi
     
     setupDirectoryStructure "$2"
+    echo ""
+    echo "=========================================================================="
+    echo "Setup complete! Now starting workflow..."
+    echo "=========================================================================="
+    echo ""
+    startWorkflow "$2"
     exit 0
 
 elif [ "$1" = "view-folders" ]; then

@@ -3,7 +3,8 @@
 #SBATCH -p general
 #SBATCH -t 7-00:00
 #SBATCH -c numCPUs
-#SBATCH -G 
+#SBATCH -G numGPUs
+#SBATCH --mem=memMB
 #SBATCH -o empty.out
 #SBATCH -e empty.err
 #SBATCH -J jobName
@@ -17,6 +18,3 @@ mkdir -p $CUDA_MPS_LOG_DIRECTORY
 nvidia-cuda-mps-control -d
 
 echo "Starting jobs"
-bash script.sh
-echo "Done"
-exec screen -Dm -S slurm$SLURM_JOB_ID

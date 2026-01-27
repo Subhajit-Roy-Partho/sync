@@ -1,0 +1,27 @@
+Input:
+  - Replicas: 4
+  - Folder: rigidDNAinput
+  - Files:
+      - "*.top"
+      - "*.dat"
+  - OutputName:
+      - input.top
+      - last_conf.dat
+  - CopyAllFiles: main
+
+Procedure:
+  - MC:
+      - BaseForce: true
+      - CheckFinish: true
+      - MaxSteps : 1000000
+      - GPU: false
+      - Memory: "10GB"
+      - CPUs: 1
+      - LastFileName: "mcLast"
+  - MDrelax:
+      - GPU: true
+  - MD:
+      - GPU: true
+
+Output:
+  - Folder: output

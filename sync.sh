@@ -522,7 +522,7 @@ elif [ "$1" = "init" ];then
     echo "Database has been initialized."
 
 elif [ "$1" = "long-update" ];then
-    echo "Quick update is called, gpu table is not updated"
+    echo "Long update is called, gpu table is also updated"
     updateGpuStatus >> /dev/null &
     statusUpdater
     wait

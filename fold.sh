@@ -283,165 +283,159 @@ function submitNextStage() {
 
 function statusUpdater() {
     local base_path="$1"
-    
+
     echo "Updating job statuses..."
-    
+
+    # Summary counters
+    local count_running=0
+    local count_pending=0
+    local count_resubmitted=0
+    local count_advanced=0
+    local count_completed=0
+    local count_submitted=0
+    local count_total=0
+
     # Save IFS
     local OLD_IFS="$IFS"
-    
-    # First, check jobs that have job IDs
+
+    # Process all active jobs (status=2) that have a Slurm job ID
     IFS='|'
-    local result=$(sqlite3 "$db_name" "SELECT id, jobid, location, stage, status, max_steps FROM jobs WHERE jobid IS NOT NULL AND jobid != '' AND jobid != 'NULL';")
-    
+    local result=$(sqlite3 "$db_name" "SELECT id, jobid, location, stage, status, max_steps FROM jobs WHERE status=2 AND jobid IS NOT NULL AND jobid != '' AND jobid != 'NULL';")
+
     if [ -n "$result" ]; then
         while read -r id jobid location stage current_status max_steps; do
             # Restore IFS for function calls
             IFS="$OLD_IFS"
-            
+
             # Skip if any critical field is empty
             if [ -z "$jobid" ] || [ -z "$location" ] || [ -z "$stage" ]; then
                 echo "Warning: Skipping job with missing data (id=$id, jobid=$jobid, location=$location, stage=$stage)"
                 IFS='|'
                 continue
             fi
-            
-            checkJob "$jobid"
-            local check_result=$?
-            
-            case $check_result in
-            0) 
-                # Job is running
-                updateStatus "$jobid" 2
-                
-                # Check actual progress based on files
-                if [ -n "$max_steps" ] && [ "$max_steps" -gt 0 ]; then
-                     local current_progress=$(calculateProgress "$location" "$max_steps")
-                     local progress_int=${current_progress%.*}
-                     
-                     if [ "$progress_int" -ge 100 ]; then
-                         echo "Job $jobid ($stage) has reached target steps ($current_progress%). Cancelling..."
-                         scancel "$jobid"
-                         
-                         # Save variables before calling functions that might corrupt them
-                         local saved_stage="$stage"
-                         local saved_location="$location"
-                         local saved_jobid="$jobid"
-                         
-                         # Archive energy files
-                         archiveEnergyFile "$saved_location" "$saved_stage"
-                         
-                         # Mark as finished
-                         updateStatus "$saved_jobid" 1
-                         
-                         # Submit next stage
-                         submitNextStage "$base_path" "$saved_location" "$saved_stage"
-                     fi
+
+            count_total=$((count_total + 1))
+
+            # Save variables before calling functions that might corrupt them
+            local saved_id="$id"
+            local saved_jobid="$jobid"
+            local saved_location="$location"
+            local saved_stage="$stage"
+            local saved_max_steps="$max_steps"
+
+            # Step 1: Calculate and update progress in the database
+            local current_progress="0"
+            if [ -n "$saved_max_steps" ] && [ "$saved_max_steps" -gt 0 ]; then
+                current_progress=$(calculateProgress "$saved_location" "$saved_max_steps")
+                sqlite3 "$db_name" "UPDATE jobs SET progress = $current_progress WHERE id = $saved_id;"
+            fi
+            local progress_int=${current_progress%.*}
+
+            # Step 2: Check if the job is actually running in Slurm
+            checkJob "$saved_jobid"
+            local slurm_status=$?
+            # slurm_status: 0=RUNNING, 1=FINISHED, 2=PENDING, 3=OTHER
+
+            local is_in_slurm=false
+            if [ "$slurm_status" -eq 0 ] || [ "$slurm_status" -eq 2 ]; then
+                is_in_slurm=true
+            fi
+
+            echo "  Job $saved_jobid ($saved_stage) at $saved_location: progress=${current_progress}%, in_slurm=${is_in_slurm}"
+
+            # Step 3: Decide action based on progress and Slurm status
+            if [ "$progress_int" -ge 100 ]; then
+                # Progress >= 100%: stop Slurm job if running, archive energy, move to next stage
+                echo "  Progress >= 100%. Completing stage $saved_stage..."
+
+                if [ "$is_in_slurm" = true ]; then
+                    echo "  Cancelling Slurm job $saved_jobid..."
+                    scancel "$saved_jobid"
                 fi
-                ;;
-            1) 
-                # Job has finished
-                echo "Job $jobid ($stage) has finished"
-                
-                # Save variables before calling functions that might corrupt them
-                local saved_stage="$stage"
-                local saved_location="$location"
-                local saved_jobid="$jobid"
-                local saved_id="$id"
-                
-                # Check if simulation completed successfully
-                if checkSimulationCompletion "$saved_location"; then
-                    echo "  Simulation completed successfully!"
-                    updateStatus "$saved_jobid" 1
-                    
-                    # Archive energy files
-                    archiveEnergyFile "$saved_location" "$saved_stage"
-                    
-                    # Submit next stage
-                    submitNextStage "$base_path" "$saved_location" "$saved_stage"
+
+                # Archive energy files
+                archiveEnergyFile "$saved_location" "$saved_stage"
+
+                # Mark as finished
+                updateStatus "$saved_jobid" 1
+
+                # Submit next stage
+                if submitNextStage "$base_path" "$saved_location" "$saved_stage"; then
+                    count_advanced=$((count_advanced + 1))
                 else
-                    echo "  Checking progress..."
-                    # Update progress and check if 100%
-                    updateJobProgress "$base_path"
-                    
-                    # Get the progress for this job
-                    local progress=$(sqlite3 "$db_name" "SELECT progress FROM jobs WHERE id=$saved_id;")
-                    local progress_int=${progress%.*}
-                    
-                    if [ "$progress_int" -ge 100 ]; then
-                        echo "  Progress is 100% or more, moving to next stage"
-                        updateStatus "$saved_jobid" 1
-                        
-                        # Archive energy files
-                        archiveEnergyFile "$saved_location" "$saved_stage"
-                        
-                        submitNextStage "$base_path" "$saved_location" "$saved_stage"
+                    count_completed=$((count_completed + 1))
+                fi
+            else
+                # Progress < 100%
+                if [ "$is_in_slurm" = true ]; then
+                    # Job is still running/pending in Slurm - let it continue
+                    echo "  Job is active in Slurm. Continuing..."
+                    if [ "$slurm_status" -eq 0 ]; then
+                        count_running=$((count_running + 1))
                     else
-                        echo "  Progress is $progress%, job incomplete - will resubmit"
-                        # Resubmit the job
-                        if [ -n "$saved_stage" ]; then
-                            local script_name="start_${saved_stage}.sh"
-                            submitJob "$saved_location" "$script_name" "$saved_stage"
-                        else
-                            echo "  ERROR: Stage is empty, cannot resubmit"
-                        fi
+                        count_pending=$((count_pending + 1))
                     fi
-                fi
-                ;;
-            2) 
-                # Job is pending
-                updateStatus "$jobid" 2
-                ;;
-            3) 
-                # Job in other state
-                echo "Job $jobid ($stage) is in unusual state, checking if it needs resubmission..."
-                if [ "$current_status" = "2" ]; then
-                    # Was supposed to be running but isn't, resubmit
-                    echo "  Resubmitting job..."
-                    local script_name="start_${stage}.sh"
-                    submitJob "$location" "$script_name" "$stage"
                 else
-                    updateStatus "$jobid" 3
+                    # Job has prematurely stopped in Slurm - resubmit with same script
+                    # Do NOT archive or touch energy.dat
+                    echo "  Job has prematurely stopped in Slurm (progress=${current_progress}%). Resubmitting..."
+                    local script_name="start_${saved_stage}.sh"
+                    submitJob "$saved_location" "$script_name" "$saved_stage"
+                    count_resubmitted=$((count_resubmitted + 1))
                 fi
-                ;;
-            esac
-            
+            fi
+
             # Reset IFS for next iteration
             IFS='|'
         done <<< "$result"
     fi
-    
+
     # Restore IFS
     IFS="$OLD_IFS"
-    
+
     # Now check for jobs that should be running but have no job ID (possibly never submitted or lost)
     IFS='|'
     local pending_result=$(sqlite3 "$db_name" "SELECT id, location, stage FROM jobs WHERE status=2 AND (jobid IS NULL OR jobid = '' OR jobid = 'NULL');")
-    
+
     if [ -n "$pending_result" ]; then
         while read -r id location stage; do
             # Restore IFS for function calls
             IFS="$OLD_IFS"
-            
+
             # Skip if any critical field is empty
             if [ -z "$location" ] || [ -z "$stage" ]; then
                 echo "Warning: Skipping job with missing location or stage (id=$id)"
                 IFS='|'
                 continue
             fi
-            
+
             echo "Job at $location ($stage) marked as running but has no job ID - submitting..."
             local script_name="start_${stage}.sh"
             submitJob "$location" "$script_name" "$stage"
-            
+            count_submitted=$((count_submitted + 1))
+            count_total=$((count_total + 1))
+
             # Reset IFS for next iteration
             IFS='|'
         done <<< "$pending_result"
     fi
-    
+
     # Restore IFS
     IFS="$OLD_IFS"
-    
-    echo "Status update complete."
+
+    # Print summary
+    echo ""
+    echo "=========================================="
+    echo "  Status Update Summary"
+    echo "=========================================="
+    echo "  Total jobs checked:    $count_total"
+    echo "  Running in Slurm:     $count_running"
+    echo "  Pending in Slurm:     $count_pending"
+    echo "  Resubmitted:          $count_resubmitted"
+    echo "  Advanced to next stage: $count_advanced"
+    echo "  Workflow completed:    $count_completed"
+    echo "  Newly submitted:      $count_submitted"
+    echo "=========================================="
 }
 
 function startWorkflow() {

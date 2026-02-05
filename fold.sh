@@ -569,6 +569,187 @@ function updateJobProgress() {
 }
 
 # =========================================================================
+# VISUAL PROGRESS DISPLAY FUNCTIONS
+# =========================================================================
+
+# Color codes for different stages (cycles through colors)
+declare -a STAGE_COLORS=(
+    "\033[38;5;196m"  # Red
+    "\033[38;5;208m"  # Orange
+    "\033[38;5;226m"  # Yellow
+    "\033[38;5;46m"   # Green
+    "\033[38;5;51m"   # Cyan
+    "\033[38;5;21m"   # Blue
+    "\033[38;5;129m"  # Purple
+    "\033[38;5;201m"  # Magenta
+    "\033[38;5;118m"  # Lime
+    "\033[38;5;39m"   # Sky Blue
+)
+
+COLOR_RESET="\033[0m"
+COLOR_GRAY="\033[38;5;240m"
+COLOR_WHITE="\033[38;5;255m"
+COLOR_BOLD="\033[1m"
+
+function drawProgressBar() {
+    local progress="$1"
+    local width="$2"
+    local color="$3"
+
+    # Ensure progress is between 0 and 100
+    if (( $(echo "$progress < 0" | bc -l) )); then
+        progress=0
+    fi
+    if (( $(echo "$progress > 100" | bc -l) )); then
+        progress=100
+    fi
+
+    # Calculate filled and empty portions
+    local filled=$(echo "scale=0; ($progress * $width) / 100" | bc)
+    local empty=$((width - filled))
+
+    # Build the bar
+    local bar=""
+    for ((i=0; i<filled; i++)); do
+        bar+="█"
+    done
+    for ((i=0; i<empty; i++)); do
+        bar+="░"
+    done
+
+    printf "${color}${bar}${COLOR_RESET}"
+}
+
+function viewGraphicalProgress() {
+    local bar_width=30
+
+    echo ""
+    printf "${COLOR_BOLD}╔════════════════════════════════════════════════════════════════════════════════╗${COLOR_RESET}\n"
+    printf "${COLOR_BOLD}║                           JOB PROGRESS OVERVIEW                               ║${COLOR_RESET}\n"
+    printf "${COLOR_BOLD}╚════════════════════════════════════════════════════════════════════════════════╝${COLOR_RESET}\n"
+    echo ""
+
+    # Get unique stages and assign colors
+    local stages=$(sqlite3 "$db_name" "SELECT DISTINCT stage FROM jobs WHERE stage IS NOT NULL ORDER BY id;")
+
+    if [ -z "$stages" ]; then
+        echo "No jobs found in database."
+        return
+    fi
+
+    # Build stage to color mapping
+    declare -A stage_color_map
+    local color_index=0
+    while IFS= read -r stage; do
+        stage_color_map["$stage"]="${STAGE_COLORS[$((color_index % ${#STAGE_COLORS[@]}))]}"
+        ((color_index++))
+    done <<< "$stages"
+
+    # Display legend
+    printf "${COLOR_BOLD}Stage Colors:${COLOR_RESET} "
+    for stage in "${!stage_color_map[@]}"; do
+        printf "${stage_color_map[$stage]}■${COLOR_RESET} $stage  "
+    done
+    echo ""
+    echo ""
+
+    # Get all jobs with progress
+    local result=$(sqlite3 -separator '|' "$db_name" "SELECT id, location, stage, progress, max_steps, status FROM jobs WHERE stage IS NOT NULL ORDER BY stage, id;")
+
+    if [ -z "$result" ]; then
+        echo "No job progress data available."
+        return
+    fi
+
+    # Calculate overall progress
+    local total_progress=0
+    local job_count=0
+    local completed_count=0
+
+    # Print header
+    printf "${COLOR_BOLD}%-4s %-35s %-10s %-32s %8s${COLOR_RESET}\n" "ID" "Location" "Stage" "Progress" "%"
+    printf "${COLOR_GRAY}────────────────────────────────────────────────────────────────────────────────────${COLOR_RESET}\n"
+
+    # Process each job
+    while IFS='|' read -r id location stage progress max_steps status; do
+        [ -z "$id" ] && continue
+
+        # Get color for this stage
+        local color="${stage_color_map[$stage]}"
+
+        # Truncate location if too long
+        local display_location="$location"
+        if [ ${#display_location} -gt 33 ]; then
+            display_location="...${display_location: -30}"
+        fi
+
+        # Format progress value
+        local progress_val=$(printf "%.1f" "$progress" 2>/dev/null || echo "0.0")
+
+        # Draw progress bar
+        printf "%-4s %-35s ${color}%-10s${COLOR_RESET} " "$id" "$display_location" "$stage"
+        drawProgressBar "$progress_val" "$bar_width" "$color"
+        printf " %6.1f%%\n" "$progress_val"
+
+        # Accumulate for overall progress
+        total_progress=$(echo "$total_progress + $progress_val" | bc)
+        ((job_count++))
+
+        if (( $(echo "$progress_val >= 100" | bc -l) )); then
+            ((completed_count++))
+        fi
+    done <<< "$result"
+
+    echo ""
+    printf "${COLOR_GRAY}────────────────────────────────────────────────────────────────────────────────────${COLOR_RESET}\n"
+
+    # Calculate and display overall progress
+    if [ $job_count -gt 0 ]; then
+        local overall_progress=$(echo "scale=1; $total_progress / $job_count" | bc)
+
+        echo ""
+        printf "${COLOR_BOLD}╔════════════════════════════════════════════════════════════════════════════════╗${COLOR_RESET}\n"
+        printf "${COLOR_BOLD}║                              OVERALL PROGRESS                                  ║${COLOR_RESET}\n"
+        printf "${COLOR_BOLD}╚════════════════════════════════════════════════════════════════════════════════╝${COLOR_RESET}\n"
+        echo ""
+
+        # Overall progress bar (gradient from red to green based on progress)
+        local overall_color
+        if (( $(echo "$overall_progress < 33" | bc -l) )); then
+            overall_color="\033[38;5;196m"  # Red
+        elif (( $(echo "$overall_progress < 66" | bc -l) )); then
+            overall_color="\033[38;5;226m"  # Yellow
+        else
+            overall_color="\033[38;5;46m"   # Green
+        fi
+
+        printf "  Total Jobs: %-5d  Completed: %-5d  In Progress: %-5d\n" "$job_count" "$completed_count" "$((job_count - completed_count))"
+        echo ""
+        printf "  ${COLOR_BOLD}Overall:${COLOR_RESET} "
+        drawProgressBar "$overall_progress" 50 "$overall_color"
+        printf " ${COLOR_BOLD}%6.1f%%${COLOR_RESET}\n" "$overall_progress"
+
+        # Stage-wise summary
+        echo ""
+        printf "  ${COLOR_BOLD}Per-Stage Summary:${COLOR_RESET}\n"
+
+        while IFS= read -r stage; do
+            local stage_data=$(sqlite3 -separator '|' "$db_name" "SELECT COUNT(*), AVG(progress) FROM jobs WHERE stage='$stage';")
+            local stage_count=$(echo "$stage_data" | cut -d'|' -f1)
+            local stage_avg=$(echo "$stage_data" | cut -d'|' -f2)
+            local stage_avg_fmt=$(printf "%.1f" "$stage_avg" 2>/dev/null || echo "0.0")
+            local color="${stage_color_map[$stage]}"
+
+            printf "    ${color}%-12s${COLOR_RESET} [%3d jobs] " "$stage" "$stage_count"
+            drawProgressBar "$stage_avg_fmt" 25 "$color"
+            printf " %6.1f%%\n" "$stage_avg_fmt"
+        done <<< "$stages"
+    fi
+
+    echo ""
+}
+
+# =========================================================================
 # SLURM SCRIPT GENERATION FUNCTIONS
 # =========================================================================
 
@@ -912,6 +1093,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     echo "  view-runs            : View all setup run history"
     echo "  update-progress <path> : Update progress for all jobs based on energy.dat files"
     echo "  view-progress        : View job progress with percentage completion"
+    echo "  viewG                : View colorful graphical progress bars with per-stage summary"
     echo "  status <path>        : Update job statuses and progress stages"
     echo ""
     echo "Workflow:"
@@ -985,6 +1167,10 @@ elif [ "$1" = "update-progress" ]; then
 elif [ "$1" = "view-progress" ]; then
     echo "Job progress from database '$db_name':"
     sqlite3 -header -column "$db_name" "SELECT id, location, stage, progress || '%' as progress, max_steps FROM jobs WHERE stage IS NOT NULL ORDER BY id;"
+    exit 0
+
+elif [ "$1" = "viewG" ]; then
+    viewGraphicalProgress
     exit 0
 
 elif [ "$1" = "run" ]; then

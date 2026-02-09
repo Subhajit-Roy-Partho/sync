@@ -1,29 +1,70 @@
 # Sync
 
-Job management system for Linux to auto resume and data manipulation for a large set of jobs.
+Linux job-management helpers for large simulation batches (SLURM + SQLite + YAML-driven workflows).
 
-#### Defaults
+## Main Scripts
 
-- `start.sh` - default slurm start script.
-- `resume.sh` - default slurm resume script
+- `sync.sh`
+  Legacy/general job manager (GPU-aware resubmission logic).
+- `fold.sh`
+  Production workflow manager for staged replica simulations from `main.yaml`.
+- `fold2.sh`
+  Enhanced workflow manager based on `fold.sh` with replica-level log checks and failure tracking.
+- `foldp.sh`
+  Parallelized variant of fold workflow submission/status checks.
 
-#### Helpful Tricks
-- `sync.sh submit "$(pwd)"` to submit a job if currently in the start location.
+## Quick Start (fold workflow)
 
-#### Status
-- 0 Active
-- 1 Stopped
-- 2 In Progress
-- 3 Other
-
-
-#### GPU Jobs
-
-To automatically select the best gpu please write in the following format `#SBATCH -G` nothing after G.
-
-The gpus will be updated for a job only if the following format is present
 ```bash
-#SBATCH -G 1
-#SBATCH -w scg025
+# initialize DB if needed
+./fold2.sh init
+
+# create simulation directory structure and scripts from main.yaml
+./fold2.sh start "$PWD"
+
+# submit first stage jobs
+./fold2.sh run "$PWD"
+
+# periodic status check (default mode)
+./fold2.sh
 ```
--w directly below -G. If you don't want the script to mistakenly consider a static configuration for dynamic gpu allocation, please don't write the two one after another.
+
+## Commands (`fold.sh` / `fold2.sh`)
+
+- `init`
+- `start <path>`
+- `run <path>`
+- `status <path>`
+- `update-progress <path>`
+- `view-progress`
+- `viewG`
+- `view-folders`
+- `view-jobs`
+- `view-runs`
+
+## Job Status Codes
+
+- `0` not started
+- `1` completed successfully
+- `2` running or pending
+- `3` failed or manual intervention required
+
+## `fold2.sh` Replica-Aware Log Behavior
+
+- Reads per-stage log filename from `main.yaml` using `Procedure -> <Stage> -> Log`.
+- On default no-arg execution (`./fold2.sh`), checks each replica log for:
+  - success line: `INFO: END OF THE SIMULATION, everything went OK!`
+  - error line containing: `ERROR`
+- Continues workflow while at least one replica is still viable.
+- Marks stage failed only when all replicas for that stage fail.
+- Lists all errored replica IDs and log files in summary output.
+
+## Database Files
+
+- `fold.db` is used by `fold.sh`, `fold2.sh`, and `foldp.sh`.
+- `test.db` is used by `sync.sh`.
+
+## Additional Documentation
+
+- Developer detail: `INFO.md`
+- Change catalog: `CHANGELOG.md`

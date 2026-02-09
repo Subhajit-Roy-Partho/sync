@@ -2,33 +2,42 @@ Input:
   - Replicas: 4
   - Folder: rigidDNAinput
   - Files:
-      - "*.top"
+      - "input.top"
       - "last_conf.dat"
+      - "force.txt"
   - OutputName:
       - input.top
       - last_conf.dat
+      - "force.txt"
   - CopyAllFiles: main
+  - Executable: "/scratch/sroy85/Github/oxOriginal/build/bin/oxDNA"
+
 
 Procedure:
   - MC:
       - BaseForce: true
       - CheckFinish: true
-      - MaxSteps : 1000000
+      - MaxSteps : 1001
       - GPU: false
       - Memory: "10GB"
       - CPUs: 1
       - LastFileName: "mcLast"
-      - Executable: "/scratch/sroy85/Github/oxOriginal/build/bin/oxDNA"
       - ExecutableInput: "inputMC"
-      - ResumeExecutable: "/scratch/sroy85/Github/oxOriginal/build/bin/oxDNA inputMC"
+      - Log: "logMC.txt"
+    #   - RunBefore:
+    #     - '/scratch/sroy85/Github/oxDNAcpp/main/src/build/terminal hbond -i input.top -d last_conf.dat -s 4.0 -e 0.13 -o "force.txt"'
   - MDrelax:
       - GPU: true
       - JobsPerGPU: 4
       - ExecutableInput: "inputRelax"
+      - MaxSteps: 1001
+      - Log: "logRelax.txt"
   - MDProd:
       - GPU: true
       - JobsPerGPU: 4
       - ExecutableInput: "input"
+      - MaxSteps: 10001
+      - Log: "log.txt"
 
 Output:
   - Folder: output

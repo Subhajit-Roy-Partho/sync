@@ -1,0 +1,1500 @@
+#!/bin/bash
+
+# Get the absolute path to the database, located in the same directory as the script.
+db_name="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fold.db"
+# fold.sh - Manages batch job submissions based on folder structure and YAML configuration
+# Usage: fold.sh start $PWD
+
+# =========================================================================
+# DATABASE INITIALIZATION
+# =========================================================================
+
+function ensureReplicaStatusTable() {
+    sqlite3 "$db_name" "CREATE TABLE IF NOT EXISTS replica_status (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        location TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        replica_id INTEGER NOT NULL,
+        log_file TEXT NOT NULL,
+        replica_state TEXT NOT NULL DEFAULT 'unknown',
+        last_match TEXT,
+        last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+        UNIQUE(location, stage, replica_id)
+    );"
+}
+
+function initDatabase() {
+    echo "Initializing database '$db_name'..."
+    
+    # Create folders table to track all created directories
+    sqlite3 "$db_name" "CREATE TABLE IF NOT EXISTS folders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        path TEXT NOT NULL UNIQUE,
+        parent_path TEXT NOT NULL,
+        simulation_name TEXT NOT NULL,
+        replica_number INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+        last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+    );"
+    
+    # Create jobs table to track job submissions
+    sqlite3 "$db_name" "CREATE TABLE IF NOT EXISTS jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        jobid TEXT,
+        status INTEGER,
+        folder_id INTEGER,
+        location TEXT,
+        type TEXT,
+        script TEXT,
+        stage TEXT,
+        progress REAL DEFAULT 0.0,
+        max_steps INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+        FOREIGN KEY(folder_id) REFERENCES folders(id)
+    );"
+    
+    # Create setup_runs table to track each time setup is run
+    sqlite3 "$db_name" "CREATE TABLE IF NOT EXISTS setup_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        base_path TEXT NOT NULL,
+        output_folder TEXT NOT NULL,
+        input_folder TEXT NOT NULL,
+        replicas INTEGER NOT NULL,
+        simulations_processed INTEGER NOT NULL,
+        folders_created INTEGER NOT NULL,
+        run_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+    );"
+
+    ensureReplicaStatusTable
+    
+    echo "Database has been initialized with tables: folders, jobs, setup_runs, replica_status"
+    echo "Database location: $db_name"
+}
+
+# =========================================================================
+# YAML PARSING AND CONFIGURATION
+# =========================================================================
+
+function parseYaml() {
+    local yaml_file="$1"
+    local key="$2"
+    
+    # Simple YAML parser for our specific structure
+    if [ ! -f "$yaml_file" ]; then
+        echo "ERROR: YAML file $yaml_file not found" >&2
+        return 1
+    fi
+    
+    case $key in
+        "Output.Folder")
+            grep -A 1 "^Output:" "$yaml_file" | grep "Folder:" | sed 's/.*Folder: *//;s/ *$//' | tr -d '"'
+            ;;
+        "Input.Folder")
+            grep -A 5 "^Input:" "$yaml_file" | grep "Folder:" | sed 's/.*Folder: *//;s/ *$//' | tr -d '"'
+            ;;
+        "Input.Replicas")
+            grep -A 5 "^Input:" "$yaml_file" | grep "Replicas:" | sed 's/.*Replicas: *//;s/ *$//'
+            ;;
+        "Input.Files")
+            # Returns comma-separated list of file patterns
+            grep -A 10 "^Input:" "$yaml_file" | sed -n '/Files:/,/OutputName:/p' | grep '^ *-' | grep -v ':' | sed 's/^ *- *//;s/ *$//;s/"//g' | tr '\n' ',' | sed 's/,$//'
+            ;;
+        "Input.OutputName")
+            # Returns comma-separated list of output names
+            grep -A 15 "^Input:" "$yaml_file" | sed -n '/OutputName:/,/CopyAllFiles:/p' | grep '^ *-' | grep -v ':' | sed 's/^ *- *//;s/ *$//;s/"//g' | tr '\n' ',' | sed 's/,$//'
+            ;;
+        "Input.CopyAllFiles")
+            grep -A 20 "^Input:" "$yaml_file" | grep "CopyAllFiles:" | head -1 | sed 's/.*CopyAllFiles: *//;s/ *$//'
+            ;;
+        "Input.Executable")
+            grep -A 25 "^Input:" "$yaml_file" | grep "Executable:" | head -1 | sed 's/.*Executable: *//;s/ *$//' | tr -d '"'
+            ;;
+        "Input.ResumeExecutable")
+            grep -A 30 "^Input:" "$yaml_file" | grep "ResumeExecutable:" | head -1 | sed 's/.*ResumeExecutable: *//;s/ *$//' | tr -d '"'
+            ;;
+    esac
+}
+
+function parseProcedureStage() {
+    local yaml_file="$1"
+    local stage="$2"
+    local property="$3"
+    
+    # Extract the stage block and get the property
+    local result=$(awk -v stage="$stage" -v prop="$property" '
+        BEGIN { in_procedure=0; in_stage=0; }
+        /^Procedure:/ { in_procedure=1; next; }
+        in_procedure && $0 ~ "^  - " stage ":" { in_stage=1; next; }
+        in_stage && /^  - [A-Z]/ { in_stage=0; }
+        in_stage && $0 ~ "      - " prop " *:" {
+            gsub(/^.*: */, "", $0);
+            gsub(/^ *| *$/, "", $0);
+            print $0;
+            exit;
+        }
+    ' "$yaml_file")
+    
+    echo "$result"
+}
+
+function parseProcedureStageList() {
+    local yaml_file="$1"
+    local stage="$2"
+    local property="$3"
+    
+    awk -v stage="$stage" -v prop="$property" '
+        BEGIN { in_procedure=0; in_stage=0; in_prop=0; }
+        /^Procedure:/ { in_procedure=1; next; }
+        in_procedure && $0 ~ "^  - " stage ":" { in_stage=1; next; }
+        in_stage && /^  - [A-Z]/ { in_stage=0; in_prop=0; }
+        in_stage && $0 ~ "      - " prop ":" { in_prop=1; next; }
+        in_prop && /^        - / {
+            sub(/^        - /, "", $0);
+            # Remove surrounding quotes if present (simple check)
+            if ($0 ~ /^".*"$/ || $0 ~ /^'"'"'.*'"'"'$/) {
+               gsub(/^["'"'"']|["'"'"']$/, "", $0);
+            }
+            print $0;
+        }
+        in_prop && !/^        - / && !/^ *$/ { in_prop=0; }
+    ' "$yaml_file"
+}
+
+function getProcedureStages() {
+    local yaml_file="$1"
+    
+    # Get all stage names from Procedure section, stop at next top-level section
+    awk '/^Procedure:/ {flag=1; next} /^[A-Z]/ && flag {exit} flag && /^  - [A-Z]/ {match($0, /^  - ([^:]+):/, arr); print arr[1]}' "$yaml_file" | tr '\n' ',' | sed 's/,$//'
+}
+
+function sqlEscape() {
+    printf "%s" "$1" | sed "s/'/''/g"
+}
+
+function stripWrappingQuotes() {
+    local value="$1"
+    value="${value%\"}"
+    value="${value#\"}"
+    value="${value%\'}"
+    value="${value#\'}"
+    echo "$value"
+}
+
+function getStageLogFileFromYaml() {
+    local yaml_file="$1"
+    local stage="$2"
+
+    local log_file
+    log_file=$(parseProcedureStage "$yaml_file" "$stage" "Log")
+    log_file=$(stripWrappingQuotes "$log_file")
+    echo "$log_file"
+}
+
+function upsertReplicaStatus() {
+    local location="$1"
+    local stage="$2"
+    local replica_id="$3"
+    local log_file="$4"
+    local replica_state="$5"
+    local last_match="$6"
+
+    local esc_location esc_stage esc_log_file esc_replica_state esc_last_match
+    esc_location=$(sqlEscape "$location")
+    esc_stage=$(sqlEscape "$stage")
+    esc_log_file=$(sqlEscape "$log_file")
+    esc_replica_state=$(sqlEscape "$replica_state")
+    esc_last_match=$(sqlEscape "$last_match")
+
+    sqlite3 "$db_name" "INSERT INTO replica_status (
+            location, stage, replica_id, log_file, replica_state, last_match, last_checked
+        ) VALUES (
+            '$esc_location', '$esc_stage', $replica_id, '$esc_log_file', '$esc_replica_state', '$esc_last_match', CURRENT_TIMESTAMP
+        )
+        ON CONFLICT(location, stage, replica_id) DO UPDATE SET
+            log_file = excluded.log_file,
+            replica_state = excluded.replica_state,
+            last_match = excluded.last_match,
+            last_checked = CURRENT_TIMESTAMP;"
+}
+
+# Global scan outputs:
+#   SCAN_TOTAL_REPLICAS, SCAN_SUCCESS_REPLICAS, SCAN_ERROR_REPLICAS, SCAN_ACTIVE_REPLICAS, SCAN_UNKNOWN_REPLICAS
+#   SCAN_NON_ERROR_REPLICAS, SCAN_ANY_SUCCESS, SCAN_ALL_FAILED, SCAN_PROGRESS, SCAN_ERROR_DETAILS
+function scanReplicaStageLogs() {
+    local location="$1"
+    local stage="$2"
+    local log_file="$3"
+    local max_steps="$4"
+
+    SCAN_TOTAL_REPLICAS=0
+    SCAN_SUCCESS_REPLICAS=0
+    SCAN_ERROR_REPLICAS=0
+    SCAN_ACTIVE_REPLICAS=0
+    SCAN_UNKNOWN_REPLICAS=0
+    SCAN_NON_ERROR_REPLICAS=0
+    SCAN_ANY_SUCCESS=0
+    SCAN_ALL_FAILED=0
+    SCAN_PROGRESS="0"
+    SCAN_ERROR_DETAILS=""
+
+    local total_steps=0
+
+    for replica_dir in "$location"/*/; do
+        [ -d "$replica_dir" ] || continue
+
+        local replica_id
+        replica_id=$(basename "$replica_dir")
+        if ! [[ "$replica_id" =~ ^[0-9]+$ ]]; then
+            continue
+        fi
+
+        SCAN_TOTAL_REPLICAS=$((SCAN_TOTAL_REPLICAS + 1))
+
+        local log_path="${replica_dir}${log_file}"
+        local state="unknown"
+        local last_match="MISSING_LOG"
+
+        if [ -f "$log_path" ]; then
+            if grep -q "ERROR" "$log_path" 2>/dev/null; then
+                state="error"
+                last_match="ERROR"
+            elif grep -q "INFO: END OF THE SIMULATION, everything went OK!" "$log_path" 2>/dev/null; then
+                state="success"
+                last_match="SUCCESS_SENTINEL"
+            else
+                state="active"
+                last_match="ACTIVE"
+            fi
+        fi
+
+        upsertReplicaStatus "$location" "$stage" "$replica_id" "$log_path" "$state" "$last_match"
+
+        case "$state" in
+            "error")
+                SCAN_ERROR_REPLICAS=$((SCAN_ERROR_REPLICAS + 1))
+                SCAN_ERROR_DETAILS+="${location}|${stage}|${replica_id}|${log_path}"$'\n'
+                ;;
+            "success")
+                SCAN_SUCCESS_REPLICAS=$((SCAN_SUCCESS_REPLICAS + 1))
+                SCAN_NON_ERROR_REPLICAS=$((SCAN_NON_ERROR_REPLICAS + 1))
+                if [ -n "$max_steps" ] && [ "$max_steps" -gt 0 ]; then
+                    total_steps=$((total_steps + max_steps))
+                fi
+                ;;
+            "active")
+                SCAN_ACTIVE_REPLICAS=$((SCAN_ACTIVE_REPLICAS + 1))
+                SCAN_NON_ERROR_REPLICAS=$((SCAN_NON_ERROR_REPLICAS + 1))
+                local energy_file="${replica_dir}energy.dat"
+                local current_step
+                current_step=$(getProgressFromEnergyFile "$energy_file")
+                total_steps=$((total_steps + current_step))
+                ;;
+            *)
+                SCAN_UNKNOWN_REPLICAS=$((SCAN_UNKNOWN_REPLICAS + 1))
+                SCAN_NON_ERROR_REPLICAS=$((SCAN_NON_ERROR_REPLICAS + 1))
+                local energy_file="${replica_dir}energy.dat"
+                local current_step
+                current_step=$(getProgressFromEnergyFile "$energy_file")
+                total_steps=$((total_steps + current_step))
+                ;;
+        esac
+    done
+
+    if [ "$SCAN_SUCCESS_REPLICAS" -gt 0 ]; then
+        SCAN_ANY_SUCCESS=1
+    fi
+
+    if [ "$SCAN_TOTAL_REPLICAS" -gt 0 ] && [ "$SCAN_ERROR_REPLICAS" -eq "$SCAN_TOTAL_REPLICAS" ]; then
+        SCAN_ALL_FAILED=1
+    fi
+
+    if [ "$SCAN_NON_ERROR_REPLICAS" -gt 0 ] && [ -n "$max_steps" ] && [ "$max_steps" -gt 0 ]; then
+        local avg_step=$((total_steps / SCAN_NON_ERROR_REPLICAS))
+        SCAN_PROGRESS=$(awk -v step="$avg_step" -v max="$max_steps" 'BEGIN {printf "%.2f", (step / max) * 100}')
+    else
+        SCAN_PROGRESS="0"
+    fi
+}
+
+# =========================================================================
+# JOB MANAGEMENT FUNCTIONS
+# =========================================================================
+
+function updateStatus() {
+    local jobid="$1"
+    local status="$2"
+    sqlite3 "$db_name" "UPDATE jobs SET status='$status' WHERE jobid='$jobid';"
+}
+
+function checkJob() {
+    local jobid="$1"
+    local status=$(squeue -h -j "$jobid" -o "%T" 2>/dev/null)
+    
+    if [[ -z "$status" ]]; then
+        echo "The job $jobid has finished"
+        return 1
+    else
+        case $status in
+        "RUNNING")   echo "The job $jobid is running"; return 0 ;;
+        "PENDING")   echo "The job $jobid is pending in queue"; return 2 ;;
+        *)           echo "The job $jobid is in: $status"; return 3 ;;
+        esac
+    fi
+}
+
+function checkSimulationCompletion() {
+    local location="$1"
+    
+    # Check for log files with success message
+    if ls "$location"/log.* 1> /dev/null 2>&1; then
+        if grep -q "INFO: END OF THE SIMULATION, everything went OK!" "$location"/log.* 2>/dev/null; then
+            return 0  # Success
+        fi
+    fi
+    
+    return 1  # Not successful
+}
+
+function isJobRunning() {
+    local location="$1"
+    
+    # Check if any job at this location has status 2 (running/pending)
+    local result=$(sqlite3 "$db_name" "SELECT count(*) FROM jobs WHERE location='$location' AND status=2;")
+    
+    if [ "${result:-0}" -gt 0 ]; then
+        return 0  # Running
+    else
+        return 1  # Not running
+    fi
+}
+
+function getNextStage() {
+    local yaml_file="$1"
+    local current_stage="$2"
+    
+    local stages; stages=$(getProcedureStages "$yaml_file")
+    IFS=',' read -ra stages_array <<< "$stages"
+    
+    local found=false
+    for stage in "${stages_array[@]}"; do
+        if [ "$found" = true ]; then
+            echo "$stage"
+            return 0
+        fi
+        if [ "$stage" = "$current_stage" ]; then
+            found=true
+        fi
+    done
+    
+    return 1  # No next stage
+}
+
+function submitJob() {
+    local location="$1"
+    local script="$2"
+    local stage="$3"
+    
+    cd "$location"
+    
+    if [ ! -f "$script" ]; then
+        echo "ERROR: Script $script not found in $location"
+        return 1
+    fi
+    
+    # Check for existing running job for this stage
+    local old_jobid=$(sqlite3 "$db_name" "SELECT jobid FROM jobs WHERE location='$location' AND stage='$stage' AND status=2;")
+    
+    if [ -n "$old_jobid" ]; then
+        echo "Found running job $old_jobid for this stage. Cancelling..."
+        scancel "$old_jobid"
+        # Optional: wait a bit to ensure cancellation propagates
+        sleep 2
+    fi
+    
+    local newjobid=$(sbatch "$script" 2>&1)
+    if [[ $newjobid =~ Submitted\ batch\ job\ ([0-9]+) ]]; then
+        newjobid="${BASH_REMATCH[1]}"
+        echo "Submitted job $newjobid for $stage in $location"
+        
+        # Update database with job ID and status
+        sqlite3 "$db_name" "UPDATE jobs SET jobid='$newjobid', status=2 WHERE location='$location' AND stage='$stage';"
+        return 0
+    else
+        echo "ERROR: Failed to submit job: $newjobid"
+        return 1
+    fi
+}
+
+function submitNextStage() {
+    local base_path="$1"
+    local location="$2"
+    local current_stage="$3"
+    local yaml_file="$base_path/main.yaml"
+    
+    # Get next stage
+    local next_stage; next_stage=$(getNextStage "$yaml_file" "$current_stage")
+    
+    if [ -z "$next_stage" ]; then
+        echo "  No more stages after $current_stage. Workflow complete for $location"
+        return 1
+    fi
+    
+    echo "  Moving from $current_stage to $next_stage for $location"
+    
+    # Submit the next stage
+    local script_name="start_${next_stage}.sh"
+    submitJob "$location" "$script_name" "$next_stage"
+}
+
+function statusUpdater() {
+    local base_path="$1"
+    local enable_log_checks="${2:-false}"
+    local yaml_file="$base_path/main.yaml"
+
+    echo "Updating job statuses..."
+    if [ "$enable_log_checks" = "true" ]; then
+        echo "Replica log checks are enabled for this run."
+    fi
+
+    # Summary counters
+    local count_running=0
+    local count_pending=0
+    local count_resubmitted=0
+    local count_advanced=0
+    local count_completed=0
+    local count_submitted=0
+    local count_total=0
+    local count_log_forced_completion=0
+    local count_all_replicas_failed=0
+    local count_replica_errors=0
+    local summary_error_details=""
+
+    # Save IFS
+    local OLD_IFS="$IFS"
+
+    # Process all active jobs (status=2) that have a Slurm job ID
+    IFS='|'
+    local result
+    result=$(sqlite3 "$db_name" "SELECT id, jobid, location, stage, status, max_steps FROM jobs WHERE status=2 AND jobid IS NOT NULL AND jobid != '' AND jobid != 'NULL';")
+
+    if [ -n "$result" ]; then
+        while read -r id jobid location stage current_status max_steps; do
+            # Restore IFS for function calls
+            IFS="$OLD_IFS"
+
+            # Skip if any critical field is empty
+            if [ -z "$jobid" ] || [ -z "$location" ] || [ -z "$stage" ]; then
+                echo "Warning: Skipping job with missing data (id=$id, jobid=$jobid, location=$location, stage=$stage)"
+                IFS='|'
+                continue
+            fi
+
+            count_total=$((count_total + 1))
+
+            # Save variables before calling functions that might corrupt them
+            local saved_id="$id"
+            local saved_jobid="$jobid"
+            local saved_location="$location"
+            local saved_stage="$stage"
+            local saved_max_steps="$max_steps"
+
+            local current_progress="0"
+            local all_replicas_failed=false
+            local force_complete_from_logs=false
+            local progress_from_logs=false
+
+            # Step 1: Calculate and update progress in the database
+            if [ "$enable_log_checks" = "true" ] && [ -f "$yaml_file" ]; then
+                local stage_log_file
+                stage_log_file=$(getStageLogFileFromYaml "$yaml_file" "$saved_stage")
+
+                if [ -n "$stage_log_file" ]; then
+                    scanReplicaStageLogs "$saved_location" "$saved_stage" "$stage_log_file" "$saved_max_steps"
+
+                    progress_from_logs=true
+                    count_replica_errors=$((count_replica_errors + SCAN_ERROR_REPLICAS))
+                    if [ -n "$SCAN_ERROR_DETAILS" ]; then
+                        summary_error_details+="$SCAN_ERROR_DETAILS"
+                    fi
+
+                    if [ "$SCAN_ALL_FAILED" -eq 1 ]; then
+                        all_replicas_failed=true
+                        current_progress="0"
+                    elif [ "$SCAN_ANY_SUCCESS" -eq 1 ]; then
+                        force_complete_from_logs=true
+                        current_progress="100"
+                    else
+                        current_progress="$SCAN_PROGRESS"
+                    fi
+                else
+                    echo "  Warning: Stage '$saved_stage' has no Log entry in main.yaml. Falling back to energy.dat progress."
+                fi
+            fi
+
+            if [ "$progress_from_logs" = false ]; then
+                if [ -n "$saved_max_steps" ] && [ "$saved_max_steps" -gt 0 ]; then
+                    current_progress=$(calculateProgress "$saved_location" "$saved_max_steps")
+                else
+                    current_progress="0"
+                fi
+            fi
+
+            sqlite3 "$db_name" "UPDATE jobs SET progress = $current_progress WHERE id = $saved_id;"
+            local progress_int=${current_progress%.*}
+            [ -z "$progress_int" ] && progress_int=0
+
+            # Step 2: Check if the job is actually running in Slurm
+            checkJob "$saved_jobid"
+            local slurm_status=$?
+            # slurm_status: 0=RUNNING, 1=FINISHED, 2=PENDING, 3=OTHER
+
+            local is_in_slurm=false
+            if [ "$slurm_status" -eq 0 ] || [ "$slurm_status" -eq 2 ]; then
+                is_in_slurm=true
+            fi
+
+            echo "  Job $saved_jobid ($saved_stage) at $saved_location: progress=${current_progress}%, in_slurm=${is_in_slurm}"
+
+            # Step 3: Decide action based on replica state, progress, and Slurm status
+            if [ "$all_replicas_failed" = true ]; then
+                echo "  All replicas failed for stage $saved_stage. Marking as failed (manual intervention needed)."
+                if [ "$is_in_slurm" = true ]; then
+                    echo "  Cancelling Slurm job $saved_jobid..."
+                    scancel "$saved_jobid"
+                fi
+                updateStatus "$saved_jobid" 3
+                count_all_replicas_failed=$((count_all_replicas_failed + 1))
+                IFS='|'
+                continue
+            fi
+
+            if [ "$progress_int" -ge 100 ]; then
+                # Progress >= 100%: stop Slurm job if running, archive energy, move to next stage
+                if [ "$force_complete_from_logs" = true ]; then
+                    echo "  Success detected in replica log(s). Forcing stage completion at 100%."
+                    count_log_forced_completion=$((count_log_forced_completion + 1))
+                else
+                    echo "  Progress >= 100%. Completing stage $saved_stage..."
+                fi
+
+                if [ "$is_in_slurm" = true ]; then
+                    echo "  Cancelling Slurm job $saved_jobid..."
+                    scancel "$saved_jobid"
+                fi
+
+                # Archive energy files
+                archiveEnergyFile "$saved_location" "$saved_stage"
+
+                # Mark as finished
+                updateStatus "$saved_jobid" 1
+
+                # Submit next stage
+                if submitNextStage "$base_path" "$saved_location" "$saved_stage"; then
+                    count_advanced=$((count_advanced + 1))
+                else
+                    count_completed=$((count_completed + 1))
+                fi
+            else
+                # Progress < 100%
+                if [ "$is_in_slurm" = true ]; then
+                    # Job is still running/pending in Slurm - let it continue
+                    echo "  Job is active in Slurm. Continuing..."
+                    if [ "$slurm_status" -eq 0 ]; then
+                        count_running=$((count_running + 1))
+                    else
+                        count_pending=$((count_pending + 1))
+                    fi
+                else
+                    # Job has prematurely stopped in Slurm - resubmit with same script
+                    # Do NOT archive or touch energy.dat
+                    echo "  Job has prematurely stopped in Slurm (progress=${current_progress}%). Resubmitting..."
+                    local script_name="start_${saved_stage}.sh"
+                    submitJob "$saved_location" "$script_name" "$saved_stage"
+                    count_resubmitted=$((count_resubmitted + 1))
+                fi
+            fi
+
+            # Reset IFS for next iteration
+            IFS='|'
+        done <<< "$result"
+    fi
+
+    # Restore IFS
+    IFS="$OLD_IFS"
+
+    # Now check for jobs that should be running but have no job ID (possibly never submitted or lost)
+    IFS='|'
+    local pending_result
+    pending_result=$(sqlite3 "$db_name" "SELECT id, location, stage, max_steps FROM jobs WHERE status=2 AND (jobid IS NULL OR jobid = '' OR jobid = 'NULL');")
+
+    if [ -n "$pending_result" ]; then
+        while read -r id location stage max_steps; do
+            # Restore IFS for function calls
+            IFS="$OLD_IFS"
+
+            # Skip if any critical field is empty
+            if [ -z "$location" ] || [ -z "$stage" ]; then
+                echo "Warning: Skipping job with missing location or stage (id=$id)"
+                IFS='|'
+                continue
+            fi
+
+            local all_replicas_failed=false
+            local success_from_logs=false
+            if [ "$enable_log_checks" = "true" ] && [ -f "$yaml_file" ]; then
+                local stage_log_file
+                stage_log_file=$(getStageLogFileFromYaml "$yaml_file" "$stage")
+
+                if [ -n "$stage_log_file" ]; then
+                    scanReplicaStageLogs "$location" "$stage" "$stage_log_file" "$max_steps"
+                    count_replica_errors=$((count_replica_errors + SCAN_ERROR_REPLICAS))
+                    if [ -n "$SCAN_ERROR_DETAILS" ]; then
+                        summary_error_details+="$SCAN_ERROR_DETAILS"
+                    fi
+
+                    if [ "$SCAN_ALL_FAILED" -eq 1 ]; then
+                        all_replicas_failed=true
+                    elif [ "$SCAN_ANY_SUCCESS" -eq 1 ]; then
+                        success_from_logs=true
+                    fi
+                fi
+            fi
+
+            if [ "$all_replicas_failed" = true ]; then
+                echo "Job at $location ($stage) has all replicas failed in logs. Marking as failed."
+                sqlite3 "$db_name" "UPDATE jobs SET status=3, progress=0 WHERE id=$id;"
+                count_all_replicas_failed=$((count_all_replicas_failed + 1))
+                count_total=$((count_total + 1))
+                IFS='|'
+                continue
+            fi
+
+            if [ "$success_from_logs" = true ]; then
+                echo "Job at $location ($stage) has successful replica log(s). Completing and advancing stage."
+                sqlite3 "$db_name" "UPDATE jobs SET status=1, progress=100 WHERE id=$id;"
+                archiveEnergyFile "$location" "$stage"
+                if submitNextStage "$base_path" "$location" "$stage"; then
+                    count_advanced=$((count_advanced + 1))
+                else
+                    count_completed=$((count_completed + 1))
+                fi
+                count_log_forced_completion=$((count_log_forced_completion + 1))
+                count_total=$((count_total + 1))
+                IFS='|'
+                continue
+            fi
+
+            echo "Job at $location ($stage) marked as running but has no job ID - submitting..."
+            local script_name="start_${stage}.sh"
+            submitJob "$location" "$script_name" "$stage"
+            count_submitted=$((count_submitted + 1))
+            count_total=$((count_total + 1))
+
+            # Reset IFS for next iteration
+            IFS='|'
+        done <<< "$pending_result"
+    fi
+
+    # Restore IFS
+    IFS="$OLD_IFS"
+
+    # Print summary
+    echo ""
+    echo "=========================================="
+    echo "  Status Update Summary"
+    echo "=========================================="
+    echo "  Total jobs checked:       $count_total"
+    echo "  Running in Slurm:         $count_running"
+    echo "  Pending in Slurm:         $count_pending"
+    echo "  Resubmitted:              $count_resubmitted"
+    echo "  Advanced to next stage:   $count_advanced"
+    echo "  Workflow completed:       $count_completed"
+    echo "  Newly submitted:          $count_submitted"
+    echo "  Log-forced completions:   $count_log_forced_completion"
+    echo "  All-replica failures:     $count_all_replicas_failed"
+    echo "  Replica ERROR matches:    $count_replica_errors"
+    echo "=========================================="
+
+    if [ -n "$summary_error_details" ]; then
+        echo ""
+        echo "Replicas with ERROR (manual intervention needed):"
+        printf "%s" "$summary_error_details" | sort -u | while IFS='|' read -r err_location err_stage err_replica err_log; do
+            [ -z "$err_location" ] && continue
+            echo "  Stage=$err_stage | Replica=$err_replica | Location=$err_location | Log=$err_log"
+        done
+    fi
+}
+
+function startWorkflow() {
+    local base_path="$1"
+    local yaml_file="$base_path/main.yaml"
+    
+    echo "Starting workflows for all simulations..."
+    
+    # Get first stage from procedure
+    local stages; stages=$(getProcedureStages "$yaml_file")
+    IFS=',' read -ra stages_array <<< "$stages"
+    local first_stage="${stages_array[0]}"
+    
+    echo "First stage: $first_stage"
+    
+    # Get all jobs for the first stage that haven't been submitted yet
+    local result=$(sqlite3 "$db_name" "SELECT location, stage FROM jobs WHERE stage='$first_stage' AND (jobid IS NULL OR jobid = '');")
+    
+    if [ -n "$result" ]; then
+        while IFS='|' read -r location stage; do
+            local script_name="start_${stage}.sh"
+            submitJob "$location" "$script_name" "$stage"
+        done <<< "$result"
+    else
+        echo "No pending jobs found for stage: $first_stage"
+    fi
+    
+    echo "Workflow start complete."
+}
+
+# =========================================================================
+# PROGRESS TRACKING FUNCTIONS
+# =========================================================================
+
+function getProgressFromEnergyFile() {
+    local energy_file="$1"
+    
+    if [ ! -f "$energy_file" ]; then
+        echo "0"
+        return
+    fi
+    
+    # Count the number of lines in the file
+    local line_count=$(wc -l < "$energy_file")
+    
+    echo "$line_count"
+}
+
+function calculateProgress() {
+    local location="$1"
+    local max_steps="$2"
+    
+    local total_steps=0
+    local replica_count=0
+    
+    for replica_dir in "$location"/*/; do
+        if [ -d "$replica_dir" ]; then
+            local energy_file="${replica_dir}energy.dat"
+            local current_step=$(getProgressFromEnergyFile "$energy_file")
+            total_steps=$((total_steps + current_step))
+            replica_count=$((replica_count + 1))
+        fi
+    done
+    
+    if [ "$replica_count" -gt 0 ] && [ "$max_steps" -gt 0 ]; then
+        local avg_step=$((total_steps / replica_count))
+        local progress=$(awk -v step="$avg_step" -v max="$max_steps" 'BEGIN {printf "%.2f", (step / max) * 100}')
+        echo "$progress"
+    else
+        echo "0"
+    fi
+}
+
+function archiveEnergyFile() {
+    local location="$1"
+    local stage="$2"
+    
+    # Iterate over replicas and rename energy.dat
+    for replica_dir in "$location"/*/; do
+        if [ -d "$replica_dir" ] && [ -f "${replica_dir}energy.dat" ]; then
+            mv "${replica_dir}energy.dat" "${replica_dir}energy${stage}.dat"
+            # Create a new empty energy.dat to prevent errors if something checks right away
+            touch "${replica_dir}energy.dat"
+        fi
+    done
+}
+
+function updateJobProgress() {
+    local base_path="$1"
+    local yaml_file="$base_path/main.yaml"
+    
+    echo "Updating job progress..."
+    
+    # Save IFS
+    local OLD_IFS="$IFS"
+    IFS='|'
+    
+    # Get all running jobs from database (status=2)
+    local result=$(sqlite3 "$db_name" "SELECT id, location, stage, max_steps FROM jobs WHERE stage IS NOT NULL AND status=2;")
+    
+    while read -r job_id location stage max_steps; do
+        # Restore IFS for function calls
+        IFS="$OLD_IFS"
+        
+        if [ -z "$location" ] || [ -z "$stage" ] || [ -z "$max_steps" ]; then
+            IFS='|'
+            continue
+        fi
+        
+        # Calculate progress using helper
+        local progress=$(calculateProgress "$location" "$max_steps")
+        
+        # Update the progress in database
+        sqlite3 "$db_name" "UPDATE jobs SET progress = $progress WHERE id = $job_id;"
+        echo "  Job $job_id ($stage): $progress% (based on $max_steps steps)"
+        
+        # Reset IFS for next iteration
+        IFS='|'
+    done <<< "$result"
+    
+    # Restore IFS
+    IFS="$OLD_IFS"
+    
+    echo "Progress update complete."
+}
+
+# =========================================================================
+# VISUAL PROGRESS DISPLAY FUNCTIONS
+# =========================================================================
+
+# Color codes for different stages (cycles through colors)
+declare -a STAGE_COLORS=(
+    "\033[38;5;196m"  # Red
+    "\033[38;5;208m"  # Orange
+    "\033[38;5;226m"  # Yellow
+    "\033[38;5;46m"   # Green
+    "\033[38;5;51m"   # Cyan
+    "\033[38;5;21m"   # Blue
+    "\033[38;5;129m"  # Purple
+    "\033[38;5;201m"  # Magenta
+    "\033[38;5;118m"  # Lime
+    "\033[38;5;39m"   # Sky Blue
+)
+
+COLOR_RESET="\033[0m"
+COLOR_GRAY="\033[38;5;240m"
+COLOR_WHITE="\033[38;5;255m"
+COLOR_BOLD="\033[1m"
+
+function drawProgressBar() {
+    local progress="$1"
+    local width="$2"
+    local color="$3"
+
+    # Ensure progress is between 0 and 100
+    if (( $(echo "$progress < 0" | bc -l) )); then
+        progress=0
+    fi
+    if (( $(echo "$progress > 100" | bc -l) )); then
+        progress=100
+    fi
+
+    # Calculate filled and empty portions
+    local filled=$(echo "scale=0; ($progress * $width) / 100" | bc)
+    local empty=$((width - filled))
+
+    # Build the bar
+    local bar=""
+    for ((i=0; i<filled; i++)); do
+        bar+="█"
+    done
+    for ((i=0; i<empty; i++)); do
+        bar+="░"
+    done
+
+    printf "${color}${bar}${COLOR_RESET}"
+}
+
+function viewGraphicalProgress() {
+    local bar_width=30
+
+    echo ""
+    printf "${COLOR_BOLD}╔════════════════════════════════════════════════════════════════════════════════╗${COLOR_RESET}\n"
+    printf "${COLOR_BOLD}║                           JOB PROGRESS OVERVIEW                               ║${COLOR_RESET}\n"
+    printf "${COLOR_BOLD}╚════════════════════════════════════════════════════════════════════════════════╝${COLOR_RESET}\n"
+    echo ""
+
+    # Get unique stages and assign colors
+    local stages=$(sqlite3 "$db_name" "SELECT DISTINCT stage FROM jobs WHERE stage IS NOT NULL ORDER BY id;")
+
+    if [ -z "$stages" ]; then
+        echo "No jobs found in database."
+        return
+    fi
+
+    # Build stage to color mapping
+    declare -A stage_color_map
+    local color_index=0
+    while IFS= read -r stage; do
+        stage_color_map["$stage"]="${STAGE_COLORS[$((color_index % ${#STAGE_COLORS[@]}))]}"
+        ((color_index++))
+    done <<< "$stages"
+
+    # Display legend
+    printf "${COLOR_BOLD}Stage Colors:${COLOR_RESET} "
+    for stage in "${!stage_color_map[@]}"; do
+        printf "${stage_color_map[$stage]}■${COLOR_RESET} $stage  "
+    done
+    echo ""
+    echo ""
+
+    # Get all jobs with progress
+    local result=$(sqlite3 -separator '|' "$db_name" "SELECT id, location, stage, progress, max_steps, status FROM jobs WHERE stage IS NOT NULL ORDER BY stage, id;")
+
+    if [ -z "$result" ]; then
+        echo "No job progress data available."
+        return
+    fi
+
+    # Calculate overall progress
+    local total_progress=0
+    local job_count=0
+    local completed_count=0
+
+    # Print header
+    printf "${COLOR_BOLD}%-4s %-35s %-10s %-32s %8s${COLOR_RESET}\n" "ID" "Location" "Stage" "Progress" "%"
+    printf "${COLOR_GRAY}────────────────────────────────────────────────────────────────────────────────────${COLOR_RESET}\n"
+
+    # Process each job
+    while IFS='|' read -r id location stage progress max_steps status; do
+        [ -z "$id" ] && continue
+
+        # Get color for this stage
+        local color="${stage_color_map[$stage]}"
+
+        # Truncate location if too long
+        local display_location="$location"
+        if [ ${#display_location} -gt 33 ]; then
+            display_location="...${display_location: -30}"
+        fi
+
+        # Format progress value
+        local progress_val=$(printf "%.1f" "$progress" 2>/dev/null || echo "0.0")
+
+        # Draw progress bar
+        printf "%-4s %-35s ${color}%-10s${COLOR_RESET} " "$id" "$display_location" "$stage"
+        drawProgressBar "$progress_val" "$bar_width" "$color"
+        printf " %6.1f%%\n" "$progress_val"
+
+        # Accumulate for overall progress
+        total_progress=$(echo "$total_progress + $progress_val" | bc)
+        ((job_count++))
+
+        if (( $(echo "$progress_val >= 100" | bc -l) )); then
+            ((completed_count++))
+        fi
+    done <<< "$result"
+
+    echo ""
+    printf "${COLOR_GRAY}────────────────────────────────────────────────────────────────────────────────────${COLOR_RESET}\n"
+
+    # Calculate and display overall progress
+    if [ $job_count -gt 0 ]; then
+        local overall_progress=$(echo "scale=1; $total_progress / $job_count" | bc)
+
+        echo ""
+        printf "${COLOR_BOLD}╔════════════════════════════════════════════════════════════════════════════════╗${COLOR_RESET}\n"
+        printf "${COLOR_BOLD}║                              OVERALL PROGRESS                                  ║${COLOR_RESET}\n"
+        printf "${COLOR_BOLD}╚════════════════════════════════════════════════════════════════════════════════╝${COLOR_RESET}\n"
+        echo ""
+
+        # Overall progress bar (gradient from red to green based on progress)
+        local overall_color
+        if (( $(echo "$overall_progress < 33" | bc -l) )); then
+            overall_color="\033[38;5;196m"  # Red
+        elif (( $(echo "$overall_progress < 66" | bc -l) )); then
+            overall_color="\033[38;5;226m"  # Yellow
+        else
+            overall_color="\033[38;5;46m"   # Green
+        fi
+
+        printf "  Total Jobs: %-5d  Completed: %-5d  In Progress: %-5d\n" "$job_count" "$completed_count" "$((job_count - completed_count))"
+        echo ""
+        printf "  ${COLOR_BOLD}Overall:${COLOR_RESET} "
+        drawProgressBar "$overall_progress" 50 "$overall_color"
+        printf " ${COLOR_BOLD}%6.1f%%${COLOR_RESET}\n" "$overall_progress"
+
+        # Stage-wise summary
+        echo ""
+        printf "  ${COLOR_BOLD}Per-Stage Summary:${COLOR_RESET}\n"
+
+        while IFS= read -r stage; do
+            local stage_data=$(sqlite3 -separator '|' "$db_name" "SELECT COUNT(*), AVG(progress) FROM jobs WHERE stage='$stage';")
+            local stage_count=$(echo "$stage_data" | cut -d'|' -f1)
+            local stage_avg=$(echo "$stage_data" | cut -d'|' -f2)
+            local stage_avg_fmt=$(printf "%.1f" "$stage_avg" 2>/dev/null || echo "0.0")
+            local color="${stage_color_map[$stage]}"
+
+            printf "    ${color}%-12s${COLOR_RESET} [%3d jobs] " "$stage" "$stage_count"
+            drawProgressBar "$stage_avg_fmt" 25 "$color"
+            printf " %6.1f%%\n" "$stage_avg_fmt"
+        done <<< "$stages"
+    fi
+
+    echo ""
+}
+
+# =========================================================================
+# SLURM SCRIPT GENERATION FUNCTIONS
+# =========================================================================
+
+function generateSlurmScript() {
+    local script_path="$1"
+    local job_name="$2"
+    local num_cpus="$3"
+    local num_gpus="$4"
+    local memory="$5"
+    local executable="$6"
+    local replicas="$7"
+    local input_file="$8"
+    local sim_folder="$9"
+    local run_before_cmds="${10}"
+    
+    cat > "$script_path" << 'EOFTEMPLATE'
+#!/bin/sh
+#SBATCH -q private
+#SBATCH -p general
+#SBATCH -t 7-00:00
+#SBATCH -c NUMCPUS
+GPULINE#SBATCH --mem=MEMORY
+#SBATCH -o empty.out
+#SBATCH -e empty.err
+#SBATCH -J JOBNAME
+
+module load cuda-12.1.1-gcc-12.1.0 gcc-12.1.0-gcc-11.2.0 cmake eigen-3.4.0-gcc-11.2.0
+
+MPSSECTION
+
+echo "Starting jobs"
+
+REPLICACOMMANDS
+
+wait
+echo "All jobs completed"
+EOFTEMPLATE
+
+    # Replace placeholders
+    sed -i "s/NUMCPUS/$num_cpus/g" "$script_path"
+    sed -i "s/MEMORY/$memory/g" "$script_path"
+    sed -i "s/JOBNAME/$job_name/g" "$script_path"
+    
+    # Handle GPU line
+    if [ "$num_gpus" = "0" ] || [ -z "$num_gpus" ]; then
+        sed -i '/GPULINE/d' "$script_path"
+    else
+        sed -i "s/GPULINE/#SBATCH -G $num_gpus\n/" "$script_path"
+    fi
+    
+    # Handle MPS section - only include if GPU is used
+    if [ "$num_gpus" = "0" ] || [ -z "$num_gpus" ]; then
+        sed -i '/MPSSECTION/d' "$script_path"
+    else
+        local mps_lines="export CUDA_MPS_PIPE_DIRECTORY=\/tmp\/mps-pipe_\$SLURM_TASK_PID\nexport CUDA_MPS_LOG_DIRECTORY=\/tmp\/mps-log_\$SLURM_TASK_PID\nmkdir -p \$CUDA_MPS_PIPE_DIRECTORY\nmkdir -p \$CUDA_MPS_LOG_DIRECTORY\nnvidia-cuda-mps-control -d\n"
+        sed -i "s/MPSSECTION/$mps_lines/" "$script_path"
+    fi
+    
+    # Generate replica commands
+    local commands=""
+    for ((i=0; i<replicas; i++)); do
+        commands+="cd $sim_folder/$i/"$'\n'
+        if [ -n "$run_before_cmds" ]; then
+             commands+="$run_before_cmds"$'\n'
+        fi
+        commands+="$executable $input_file &"$'\n'
+        commands+="cd .."$'\n'
+    done
+    
+    # Use a temporary file to safely replace the placeholder
+    local temp_commands_file
+    temp_commands_file=$(mktemp)
+    printf "%s" "$commands" > "$temp_commands_file"
+    
+    local temp_script_file
+    temp_script_file=$(mktemp)
+    
+    # Read the template and replace the placeholder with the content of the commands file
+    local placeholder_found=false
+    while IFS= read -r line; do
+        if [[ "$line" == "REPLICACOMMANDS" ]]; then
+            placeholder_found=true
+            cat "$temp_commands_file"
+        else
+            echo "$line"
+        fi
+    done < "$script_path" > "$temp_script_file"
+    
+    # Overwrite the original script with the corrected content
+    mv "$temp_script_file" "$script_path"
+    
+    # Clean up the temporary commands file
+    rm "$temp_commands_file"
+    
+    chmod +x "$script_path"
+}
+
+function generateJobScripts() {
+    local base_path="$1"
+    local yaml_file="$base_path/main.yaml"
+    local output_folder="$2"
+    local replicas="$3"
+    local sim_name="$4"
+    local sim_folder="$5"
+    
+    # Get executable paths
+    local executable; executable=$(parseYaml "$yaml_file" "Input.Executable")
+    
+    # Get procedure stages
+    local stages; stages=$(getProcedureStages "$yaml_file")
+    IFS=',' read -ra stages_array <<< "$stages"
+    
+    echo "  Generating SLURM scripts for $sim_name..."
+    
+    for stage in "${stages_array[@]}"; do
+        # Parse stage properties
+        local gpu; gpu=$(parseProcedureStage "$yaml_file" "$stage" "GPU")
+        local cpus; cpus=$(parseProcedureStage "$yaml_file" "$stage" "CPUs")
+        local memory; memory=$(parseProcedureStage "$yaml_file" "$stage" "Memory")
+        local exec_input; exec_input=$(parseProcedureStage "$yaml_file" "$stage" "ExecutableInput")
+        local jobs_per_gpu; jobs_per_gpu=$(parseProcedureStage "$yaml_file" "$stage" "JobsPerGPU")
+        local max_steps; max_steps=$(parseProcedureStage "$yaml_file" "$stage" "MaxSteps")
+        local run_before_cmds; run_before_cmds=$(parseProcedureStageList "$yaml_file" "$stage" "RunBefore")
+        
+        # Set defaults
+        [ -z "$memory" ] && memory="40GB"
+        [ -z "$cpus" ] && cpus=1
+        [ -z "$max_steps" ] && max_steps=0
+        
+        # Calculate total CPUs
+        local total_cpus=$((cpus * replicas))
+        
+        # Determine GPU count
+        local num_gpus=0
+        if [ "$gpu" = "true" ]; then
+            if [ -n "$jobs_per_gpu" ] && [ "$jobs_per_gpu" -gt 0 ]; then
+                # Calculate number of GPUs needed: ceil(replicas / jobs_per_gpu)
+                num_gpus=$(( (replicas + jobs_per_gpu - 1) / jobs_per_gpu ))
+            else
+                num_gpus=1
+            fi
+        fi
+        
+        # Generate job name
+        local job_name="${sim_name}_${stage}"
+        
+        # Generate script
+        local script_name="start_${stage}.sh"
+        local script_path="$sim_folder/$script_name"
+        
+        generateSlurmScript "$script_path" "$job_name" "$total_cpus" "$num_gpus" "$memory" "$executable" "$replicas" "$exec_input" "$sim_folder" "$run_before_cmds"
+        
+        # Insert job record into database
+        sqlite3 "$db_name" "INSERT INTO jobs (location, type, script, stage, max_steps, status) 
+            VALUES ('$sim_folder', 'slurm', '$script_name', '$stage', $max_steps, 0);" 2>/dev/null
+        
+        echo "    Generated: $script_name (CPUs: $total_cpus, GPUs: $num_gpus, Mem: $memory, MaxSteps: $max_steps)"
+    done
+}
+
+# =========================================================================
+# DIRECTORY SETUP FUNCTIONS
+# =========================================================================
+
+function setupDirectoryStructure() {
+    local base_path="$1"
+    local yaml_file="$base_path/main.yaml"
+    
+    if [ ! -f "$yaml_file" ]; then
+        echo "ERROR: main.yaml not found at $base_path"
+        return 1
+    fi
+    
+    echo "Reading configuration from: $yaml_file"
+    
+    # Parse YAML configuration
+    local output_folder; output_folder=$(parseYaml "$yaml_file" "Output.Folder")
+    local input_folder; input_folder=$(parseYaml "$yaml_file" "Input.Folder")
+    local replicas; replicas=$(parseYaml "$yaml_file" "Input.Replicas")
+    local input_patterns; input_patterns=$(parseYaml "$yaml_file" "Input.Files")
+    local output_names; output_names=$(parseYaml "$yaml_file" "Input.OutputName")
+    local copy_all_folder; copy_all_folder=$(parseYaml "$yaml_file" "Input.CopyAllFiles")
+    
+    echo "Configuration:"
+    echo "  Output folder: $output_folder"
+    echo "  Input folder: $input_folder"
+    echo "  Replicas: $replicas"
+    echo "  File patterns: $input_patterns"
+    echo "  Output names: $output_names"
+    echo "  Copy all files from: $copy_all_folder"
+    echo ""
+    
+    # Create output directory
+    local output_path="$base_path/$output_folder"
+    if [ ! -d "$output_path" ]; then
+        mkdir -p "$output_path"
+        echo "Created output directory: $output_path"
+    else
+        echo "Output directory already exists: $output_path"
+    fi
+    
+    # Get input directory path
+    local input_path="$base_path/$input_folder"
+    if [ ! -d "$input_path" ]; then
+        echo "ERROR: Input directory not found: $input_path"
+        return 1
+    fi
+    
+    echo "Processing simulations from: $input_path"
+    echo ""
+    
+    # Convert comma-separated strings to arrays
+    IFS=',' read -ra patterns_array <<< "$input_patterns"
+    IFS=',' read -ra names_array <<< "$output_names"
+    
+    # Get input folder name for simulation naming
+    local input_folder_name=$(basename "$input_path")
+    
+    # Process each folder in the input directory
+    local count=0
+    local total_folders_created=0
+    
+    for sim_folder in "$input_path"/*/; do
+        if [ ! -d "$sim_folder" ]; then
+            continue
+        fi
+        
+        # Get the folder name without trailing slash
+        local sim_name=$(basename "$sim_folder")
+        # Combine input folder name with subfolder name for full simulation name
+        local full_sim_name="${input_folder_name}_${sim_name}"
+        
+        echo "Processing simulation: $sim_name"
+        
+        # Create simulation folder in output
+        local sim_output="$output_path/$sim_name"
+        
+        # Check if job is already running
+        if isJobRunning "$sim_output"; then
+            echo "Skipping setup for $sim_name: Job is already running or pending."
+            continue
+        fi
+        
+        mkdir -p "$sim_output"
+        
+        # Create replica folders (0, 1, 2, 3, ...)
+        for ((i=0; i<replicas; i++)); do
+            local replica_folder="$sim_output/$i"
+            mkdir -p "$replica_folder"
+            
+            # Track folder in database
+            sqlite3 "$db_name" "INSERT OR IGNORE INTO folders (path, parent_path, simulation_name, replica_number, last_modified) 
+                VALUES ('$replica_folder', '$sim_output', '$sim_name', $i, CURRENT_TIMESTAMP);" 2>/dev/null
+            
+            total_folders_created=$((total_folders_created + 1))
+            
+            # Copy files based on patterns
+            for idx in "${!patterns_array[@]}"; do
+                local pattern="${patterns_array[$idx]}"
+                local output_name="${names_array[$idx]}"
+                
+                # Find files matching the pattern in the input folder
+                local found_files=( "$sim_folder"/$pattern )
+                
+                if [ -e "${found_files[0]}" ]; then
+                    # Copy the first matching file with the new name
+                    cp "${found_files[0]}" "$replica_folder/$output_name"
+                    echo "  Replica $i: Copied ${found_files[0]##*/} -> $output_name"
+                else
+                    echo "  WARNING: No files matching pattern '$pattern' found in $sim_name"
+                fi
+            done
+            
+            # Copy all files from CopyAllFiles folder if specified
+            if [ -n "$copy_all_folder" ] && [ -d "$base_path/$copy_all_folder" ]; then
+                cp "$base_path/$copy_all_folder"/* "$replica_folder/" 2>/dev/null
+                echo "  Replica $i: Copied all files from $copy_all_folder"
+            fi
+        done
+        
+        count=$((count + 1))
+        echo "  Created $replicas replicas for $sim_name"
+        
+        # Generate SLURM scripts for this simulation
+        generateJobScripts "$base_path" "$output_folder" "$replicas" "$full_sim_name" "$sim_output"
+        echo ""
+    done
+    
+    # Record this setup run in the database
+    sqlite3 "$db_name" "INSERT INTO setup_runs (base_path, output_folder, input_folder, replicas, simulations_processed, folders_created) 
+        VALUES ('$base_path', '$output_folder', '$input_folder', $replicas, $count, $total_folders_created);" 2>/dev/null
+    
+    echo "=========================================================================="
+    echo "Setup complete!"
+    echo "Total simulations processed: $count"
+    echo "Total replica folders created: $total_folders_created"
+    echo "Database updated with folder tracking information"
+    echo "=========================================================================="
+}
+
+# =========================================================================
+# MAIN SCRIPT LOGIC AND COMMAND PARSER
+# =========================================================================
+
+function ensureDatabase() {
+    if [ ! -f "$db_name" ]; then
+        echo "Database not found. Initializing..."
+        initDatabase
+    fi
+    ensureReplicaStatusTable
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+
+    # Ensure database exists before any operation (except help and init)
+    if [ "$1" != "help" ] && [ "$1" != "init" ]; then
+        ensureDatabase
+    fi
+
+    if [ $# -eq 0 ]; then
+        # Default: update status and exit (run this periodically via cron or manually)
+        if [ -f "$PWD/main.yaml" ]; then
+            statusUpdater "$PWD" "true"
+            exit 0
+        else
+            echo "ERROR: main.yaml not found in current directory"
+            echo "Run '$0 help' to see usage information"
+            exit 1
+        fi
+    
+    elif [ "$1" = "help" ]; then
+    echo "fold.sh - Job management for batch simulations"
+    echo ""
+    echo "Usage: $0 COMMAND [arguments]"
+    echo ""
+    echo "Commands:"
+    echo "  init                 : Initialize the database for tracking folders and jobs"
+    echo "  start <path>         : Initialize directory structure from main.yaml"
+    echo "  run <path>           : Start workflow for all simulations (submit first stage)"
+    echo "  view-folders         : View all tracked folders in the database"
+    echo "  view-jobs            : View all tracked jobs in the database"
+    echo "  view-runs            : View all setup run history"
+    echo "  update-progress <path> : Update progress for all jobs based on energy.dat files"
+    echo "  view-progress        : View job progress with percentage completion"
+    echo "  viewG                : View colorful graphical progress bars with per-stage summary"
+    echo "  status <path>        : Update job statuses and progress stages"
+    echo ""
+    echo "Workflow:"
+    echo "  1. $0 init                    # Initialize database"
+    echo "  2. $0 start \$PWD              # Setup directories and create scripts"
+    echo "  3. $0 run \$PWD                # Submit first stage jobs"
+    echo "  4. $0                         # Update statuses (run periodically)"
+    echo "  5. $0 view-progress           # Check progress"
+    echo ""
+    echo "Status Codes:"
+    echo "  0 = Not started/Completed"
+    echo "  1 = Completed successfully"
+    echo "  2 = Running/Pending"
+    echo "  3 = Failed/Other"
+    exit 0
+
+elif [ "$1" = "init" ]; then
+    initDatabase
+
+elif [ "$1" = "start" ]; then
+    if [ $# -ne 2 ]; then
+        echo "ERROR: start command requires a path argument"
+        echo "Usage: $0 start <path>"
+        exit 1
+    fi
+    
+    if [ ! -d "$2" ]; then
+        echo "ERROR: Directory not found: $2"
+        exit 1
+    fi
+    
+    setupDirectoryStructure "$2"
+    echo ""
+    echo "=========================================================================="
+    echo "Setup complete! Now starting workflow..."
+    echo "=========================================================================="
+    echo ""
+    startWorkflow "$2"
+    exit 0
+
+elif [ "$1" = "view-folders" ]; then
+    echo "Tracked folders in database '$db_name':"
+    sqlite3 -header -column "$db_name" "SELECT id, simulation_name, replica_number, path, created_at FROM folders ORDER BY simulation_name, replica_number;"
+    exit 0
+
+elif [ "$1" = "view-jobs" ]; then
+    echo "Tracked jobs in database '$db_name':"
+    sqlite3 -header -column "$db_name" "SELECT * FROM jobs ORDER BY id;"
+    exit 0
+
+elif [ "$1" = "view-runs" ]; then
+    echo "Setup run history from database '$db_name':"
+    sqlite3 -header -column "$db_name" "SELECT * FROM setup_runs ORDER BY run_timestamp DESC;"
+    exit 0
+
+elif [ "$1" = "update-progress" ]; then
+    if [ $# -ne 2 ]; then
+        echo "ERROR: update-progress command requires a path argument"
+        echo "Usage: $0 update-progress <path>"
+        exit 1
+    fi
+    
+    if [ ! -d "$2" ]; then
+        echo "ERROR: Directory not found: $2"
+        exit 1
+    fi
+    
+    updateJobProgress "$2"
+    exit 0
+
+elif [ "$1" = "view-progress" ]; then
+    echo "Job progress from database '$db_name':"
+    sqlite3 -header -column "$db_name" "SELECT id, location, stage, progress || '%' as progress, max_steps FROM jobs WHERE stage IS NOT NULL ORDER BY id;"
+    exit 0
+
+elif [ "$1" = "viewG" ]; then
+    viewGraphicalProgress
+    exit 0
+
+elif [ "$1" = "run" ]; then
+    if [ $# -ne 2 ]; then
+        echo "ERROR: run command requires a path argument"
+        echo "Usage: $0 run <path>"
+        exit 1
+    fi
+    
+    if [ ! -d "$2" ]; then
+        echo "ERROR: Directory not found: $2"
+        exit 1
+    fi
+    
+    # First update statuses before starting new jobs
+    echo "Checking current job statuses..."
+    statusUpdater "$2" "false"
+    echo ""
+    
+    # Then start workflow
+    startWorkflow "$2"
+    exit 0
+
+elif [ "$1" = "status" ]; then
+    if [ $# -ne 2 ]; then
+        echo "ERROR: status command requires a path argument"
+        echo "Usage: $0 status <path>"
+        exit 1
+    fi
+    
+    if [ ! -d "$2" ]; then
+        echo "ERROR: Directory not found: $2"
+        exit 1
+    fi
+    
+    statusUpdater "$2" "false"
+    exit 0
+
+else
+    echo "ERROR: Unknown command '$1'"
+    echo "Run '$0 help' to see usage information"
+    exit 1
+fi
+
+fi
